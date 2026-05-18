@@ -29,8 +29,12 @@ void minigraf_string_free(char *s);
 // Flush the WAL to the database file. Returns 0 on success, -1 on error.
 int minigraf_checkpoint(struct MiniGrafDb *handle);
 
-// Return the last error message. Valid until the next call on the same handle.
-// Returns NULL if no error has occurred.
+/**
+ * Returns the last error message for a handle.
+ *
+ * The returned pointer is valid only until the next call on the same handle.
+ * Do NOT free the returned pointer. Returns NULL if no error has occurred.
+ */
 const char *minigraf_last_error(struct MiniGrafDb *handle);
 
 #endif  /* MINIGRAF_H */

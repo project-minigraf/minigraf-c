@@ -33,7 +33,7 @@ int main(void) {
 }
 ```
 
-Compile: `cc -o example example.c -L. -lminigraf -Wl,-rpath,.`
+Compile: `cc -o example example.c -Iinclude -L. -lminigraf -Wl,-rpath,.`
 
 ## Memory contract
 
