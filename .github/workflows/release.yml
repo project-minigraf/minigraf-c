@@ -1,0 +1,144 @@
+name: C Release
+
+on:
+  repository_dispatch:
+    types: [core-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Pin version, commit, tag, create release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      semver: ${{ steps.ver.outputs.semver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+
+      - id: ver
+        run: |
+          V="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pin minigraf version in Cargo.toml
+        run: |
+          sed -i 's/^minigraf = "[^"]*"/minigraf = "${{ steps.ver.outputs.semver }}"/' Cargo.toml
+
+      - name: Commit and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: release ${{ steps.ver.outputs.tag }}"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin main --follow-tags
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "minigraf-c ${{ steps.ver.outputs.tag }}" \
+            --notes "C bindings for minigraf ${{ steps.ver.outputs.tag }}. Download the library for your platform below."
+
+  build:
+    name: Build C library (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-name: linux-x86_64
+            lib-name: libminigraf.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact-name: linux-aarch64
+            lib-name: libminigraf.so
+          - os: macos-14
+            target: universal2
+            artifact-name: macos-universal2
+            lib-name: libminigraf.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact-name: windows-x86_64
+            lib-name: minigraf.dll
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal2' && 'aarch64-apple-darwin x86_64-apple-darwin' || matrix.target }}
+
+      - name: Build (universal2)
+        if: matrix.target == 'universal2'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/libminigraf.dylib \
+            target/x86_64-apple-darwin/release/libminigraf.dylib \
+            -output ${{ matrix.lib-name }}
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/libminigraf.so ${{ matrix.lib-name }}
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          copy target\${{ matrix.target }}\release\minigraf.dll ${{ matrix.lib-name }}
+        shell: pwsh
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar czf minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.tar.gz \
+            ${{ matrix.lib-name }} include/minigraf.h
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path ${{ matrix.lib-name }},include\minigraf.h `
+            -DestinationPath minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.zip
+        shell: pwsh
+
+      - name: Upload to GitHub Release (unix)
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload to GitHub Release (windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" `
+            "minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.zip" `
+            --repo "$GITHUB_REPOSITORY" --clobber
+        shell: pwsh
