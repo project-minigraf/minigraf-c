@@ -30,9 +30,24 @@ jobs:
           echo "tag=$V" >> "$GITHUB_OUTPUT"
           echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Wait for minigraf ${{ steps.ver.outputs.semver }} on crates.io
+        run: |
+          for i in $(seq 1 10); do
+            if cargo search minigraf --limit 1 | grep -q '"${{ steps.ver.outputs.semver }}"'; then
+              echo "Found minigraf ${{ steps.ver.outputs.semver }} on crates.io"
+              exit 0
+            fi
+            echo "Attempt $i/10 — not yet indexed, waiting 15s..."
+            sleep 15
+          done
+          echo "minigraf ${{ steps.ver.outputs.semver }} not found on crates.io after 150s" >&2
+          exit 1
+
       - name: Pin minigraf version in Cargo.toml
         run: |
-          sed -i 's/^minigraf = "[^"]*"/minigraf = "${{ steps.ver.outputs.semver }}"/' Cargo.toml
+          sed -i 's/^minigraf = "[^"]*"/minigraf = "=${{ steps.ver.outputs.semver }}"/' Cargo.toml
           cargo update --precise "${{ steps.ver.outputs.semver }}" minigraf
 
       - name: Commit and push tag
