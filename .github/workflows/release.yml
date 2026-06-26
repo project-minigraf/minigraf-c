@@ -70,12 +70,14 @@ jobs:
           else
             echo "Tag ${{ steps.ver.outputs.tag }} already exists, skipping"
           fi
-          git push origin main --follow-tags
+          git push origin main
+          git push origin "${{ steps.ver.outputs.tag }}" || true
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gh release view "${{ steps.ver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
           gh release create "${{ steps.ver.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "minigraf-c ${{ steps.ver.outputs.tag }}" \
