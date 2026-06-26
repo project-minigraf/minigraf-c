@@ -34,17 +34,21 @@ jobs:
 
       - name: Wait for minigraf ${{ steps.ver.outputs.semver }} on crates.io
         run: |
-          for i in $(seq 1 10); do
-            if cargo search minigraf --limit 1 | grep -q '"${{ steps.ver.outputs.semver }}"'; then
-              echo "Found minigraf ${{ steps.ver.outputs.semver }} on crates.io"
+          SEMVER="${{ steps.ver.outputs.semver }}"
+          echo "Waiting for minigraf@$SEMVER on crates.io..."
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s "https://crates.io/api/v1/crates/minigraf/$SEMVER" \
+              -H "User-Agent: minigraf-binding/1.0" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('version',{}).get('num',''))" 2>/dev/null || echo "")
+            if [ "$STATUS" = "$SEMVER" ]; then
+              echo "minigraf@$SEMVER is live (attempt $i)"
               exit 0
             fi
-            echo "Attempt $i/10 — not yet indexed, waiting 15s..."
+            echo "Attempt $i/20: not yet available, waiting 15s..."
             sleep 15
           done
-          echo "minigraf ${{ steps.ver.outputs.semver }} not found on crates.io after 150s" >&2
+          echo "ERROR: minigraf@$SEMVER not found on crates.io after 5 minutes" >&2
           exit 1
-
       - name: Pin minigraf version in Cargo.toml
         run: |
           sed -i 's/^minigraf = "[^"]*"/minigraf = "=${{ steps.ver.outputs.semver }}"/' Cargo.toml
@@ -158,3 +162,4 @@ jobs:
             "minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.zip" `
             --repo "$GITHUB_REPOSITORY" --clobber
         shell: pwsh
+
