@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to test (release.yml passes the pinned release tag)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -15,6 +22,8 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -- --nocapture
 
@@ -23,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cbindgen
         run: cargo install cbindgen --version 0.29.2 --locked

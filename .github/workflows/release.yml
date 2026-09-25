@@ -14,11 +14,12 @@ permissions:
 
 jobs:
   prepare:
-    name: Pin version, commit, tag, create release
+    name: Pin version, commit, tag
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
       semver: ${{ steps.ver.outputs.semver }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,7 +56,10 @@ jobs:
           sed -i 's/\(minigraf = {[^}]*version = \"\)[^\"]*/\1=${{ steps.ver.outputs.semver }}/' Cargo.toml
           cargo update --precise "${{ steps.ver.outputs.semver }}" minigraf
 
-      - name: Commit and push tag
+      # Push the pin commit to a throwaway branch only. The tag and main are
+      # updated by the tag job, after the test job has passed on this commit.
+      - name: Commit and push release branch
+        id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -65,27 +69,67 @@ jobs:
           else
             echo "Cargo.toml already pinned, skipping commit"
           fi
-          if ! git rev-parse "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
-            git tag "${{ steps.ver.outputs.tag }}"
-          else
-            echo "Tag ${{ steps.ver.outputs.tag }} already exists, skipping"
-          fi
-          git push origin main
-          git push origin "${{ steps.ver.outputs.tag }}" || true
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git push --force origin "HEAD:refs/heads/release/${{ steps.ver.outputs.tag }}"
 
+  # Run this binding's test suite against the exact pinned core version before
+  # anything becomes visible: no tag, no main update, no publish until it passes.
+  test:
+    name: Test pinned release
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  tag:
+    name: Push tag and update main
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+
+      - name: Push tag, fast-forward main, delete release branch
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          if [ -z "$EXISTING" ]; then
+            REFS=("$SHA:refs/heads/main" "$SHA:refs/tags/$TAG")
+          elif [ "$EXISTING" = "$SHA" ]; then
+            echo "Tag $TAG already points at $SHA, skipping tag push"
+            REFS=("$SHA:refs/heads/main")
+          else
+            echo "::error::Tag $TAG already exists at $EXISTING, but the tested commit is $SHA. Delete the tag and re-run to release the tested commit."
+            exit 1
+          fi
+          # Atomic: main and the tag move together or not at all. Rejected if
+          # main moved during the release; re-run to re-pin on the new main.
+          git push --atomic origin "${REFS[@]}"
+          git push origin --delete "release/$TAG" \
+            || echo "::warning::Could not delete branch release/$TAG"
+
+  create-release:
+    name: Create GitHub Release
+    needs: [prepare, tag]
+    runs-on: ubuntu-latest
+    steps:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "${{ steps.ver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-          gh release create "${{ steps.ver.outputs.tag }}" \
+          gh release view "${{ needs.prepare.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "${{ needs.prepare.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "minigraf-c ${{ steps.ver.outputs.tag }}" \
-            --notes "C bindings for minigraf ${{ steps.ver.outputs.tag }}. Download the library for your platform below."
+            --title "minigraf-c ${{ needs.prepare.outputs.tag }}" \
+            --notes "C bindings for minigraf ${{ needs.prepare.outputs.tag }}. Download the library for your platform below."
 
   build:
     name: Build C library (${{ matrix.os }})
-    needs: prepare
+    needs: [prepare, create-release]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
