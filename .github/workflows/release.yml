@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   prepare:
-    name: Pin version, commit, tag, create release
+    name: Pin version, commit, tag
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
@@ -73,19 +73,34 @@ jobs:
           git push origin main
           git push origin "${{ steps.ver.outputs.tag }}" || true
 
+  # Gate every build/publish job on this binding's test suite, run against the
+  # exact pinned core version that prepare just tagged. ci.yml also runs on the
+  # version-pin push to main, but nothing waits on that run.
+  test:
+    name: Test pinned release
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    steps:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "${{ steps.ver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-          gh release create "${{ steps.ver.outputs.tag }}" \
+          gh release view "${{ needs.prepare.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "${{ needs.prepare.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "minigraf-c ${{ steps.ver.outputs.tag }}" \
-            --notes "C bindings for minigraf ${{ steps.ver.outputs.tag }}. Download the library for your platform below."
+            --title "minigraf-c ${{ needs.prepare.outputs.tag }}" \
+            --notes "C bindings for minigraf ${{ needs.prepare.outputs.tag }}. Download the library for your platform below."
 
   build:
     name: Build C library (${{ matrix.os }})
-    needs: prepare
+    needs: [prepare, create-release]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
