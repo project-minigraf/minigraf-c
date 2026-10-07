@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v3]
   pull_request:
   workflow_call:
     inputs:
@@ -26,6 +26,24 @@ jobs:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -- --nocapture
+
+  # Compiles a C program against include/minigraf.h and the static library and
+  # runs it, so the header and the C calling convention are tested, not only Rust.
+  c-smoke:
+    name: C smoke test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Compile and run tests/c/etl_smoke.c
+        run: |
+          gcc -std=c99 -Wall -Wextra -Werror -Iinclude tests/c/etl_smoke.c \
+            target/release/libminigraf.a -lpthread -ldl -lm -o etl_smoke
+          dir=$(mktemp -d)
+          ./etl_smoke "$dir"
 
   check-header-drift:
     name: Verify minigraf.h is up to date

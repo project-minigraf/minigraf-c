@@ -5,10 +5,17 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef struct MiniGrafCursor MiniGrafCursor;
+
 typedef struct MiniGrafDb MiniGrafDb;
+
+typedef struct MiniGrafFactLog MiniGrafFactLog;
+
+typedef struct MiniGrafLogWriter MiniGrafLogWriter;
 
 // Open a file-backed Minigraf database. Returns NULL on error.
 struct MiniGrafDb *minigraf_open(const char *path);
@@ -28,6 +35,102 @@ void minigraf_string_free(char *s);
 
 // Flush the WAL to the database file. Returns 0 on success, -1 on error.
 int minigraf_checkpoint(struct MiniGrafDb *handle);
+
+// Open a file-backed database with `options_json`, a JSON object with any of
+// `read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`,
+// `max_derived_facts`, `max_results` and `synchronous` (`"full"` or
+// `"normal"`); NULL means all defaults. Returns NULL on error and, if
+// `error_out` is not NULL, stores the message there (free it with
+// `minigraf_string_free`).
+struct MiniGrafDb *minigraf_open_with_options(const char *path,
+                                              const char *options_json,
+                                              char **error_out);
+
+// The transaction counter that `:as-of N` compares against, in `*out`.
+// Returns 0 on success, -1 on error.
+int minigraf_current_tx_count(struct MiniGrafDb *handle, uint64_t *out);
+
+// Open a cursor over a `(query ...)`; its answer is fixed when it opens.
+// Returns NULL on error (call `minigraf_last_error` on `handle`). Free the
+// cursor with `minigraf_cursor_free`.
+struct MiniGrafCursor *minigraf_query(struct MiniGrafDb *handle, const char *datalog);
+
+// The `:find` variables as a JSON array of strings. Free with
+// `minigraf_string_free`.
+char *minigraf_cursor_vars(struct MiniGrafCursor *cursor);
+
+// The next batch of at most `max_rows` rows (0 counts as 1) as a JSON array of
+// rows, encoded like `minigraf_execute`'s `results`; free it with
+// `minigraf_string_free`. Returns NULL at the end, or on error, when
+// `minigraf_cursor_last_error` is not NULL.
+char *minigraf_cursor_next_batch(struct MiniGrafCursor *cursor, size_t max_rows);
+
+// The error of the last `minigraf_cursor_next_batch`, or NULL if it had none.
+// Valid until the next call on the cursor.
+const char *minigraf_cursor_last_error(struct MiniGrafCursor *cursor);
+
+// Close a cursor and free it.
+void minigraf_cursor_free(struct MiniGrafCursor *cursor);
+
+// Stream every fact record that `filter_json` keeps: a JSON object with any of
+// `attributes`, `attribute_prefixes`, `entities` (UUID strings), `tx_from` and
+// `tx_to` (inclusive), `order` (`"tx"` or `"storage"`) and `window`; NULL keeps
+// every record. Checkpoints wait until the log ends or is freed. Returns NULL
+// on error (call `minigraf_last_error` on `handle`).
+struct MiniGrafFactLog *minigraf_fact_log(struct MiniGrafDb *handle, const char *filter_json);
+
+// The next batch of at most `max_records` records (0 counts as 1) as a JSON
+// array of records: `{"entity", "attribute", "value": {"type", "value"},
+// "tx_count", "tx_id", "valid_from", "valid_to", "asserted"}`. Free it with
+// `minigraf_string_free`. Returns NULL at the end, or on error, when
+// `minigraf_fact_log_last_error` is not NULL.
+char *minigraf_fact_log_next_batch(struct MiniGrafFactLog *log, size_t max_records);
+
+// The error of the last `minigraf_fact_log_next_batch`, or NULL if it had
+// none. Valid until the next call on the log.
+const char *minigraf_fact_log_last_error(struct MiniGrafFactLog *log);
+
+// Close a fact log, releasing the database, and free it.
+void minigraf_fact_log_free(struct MiniGrafFactLog *log);
+
+// Start building a new database at `path` from fact records (`STG-043` if it
+// exists). `options_json` is as for `minigraf_open_with_options`. Returns NULL
+// on error and, if `error_out` is not NULL, stores the message there (free it
+// with `minigraf_string_free`). Free the writer with
+// `minigraf_log_writer_free`; freeing it before `minigraf_log_writer_finish`
+// abandons the build and leaves no file.
+struct MiniGrafLogWriter *minigraf_log_writer_create(const char *path,
+                                                     const char *options_json,
+                                                     char **error_out);
+
+// Append one record, a JSON object as returned by
+// `minigraf_fact_log_next_batch`. A rejected record changes nothing.
+// Returns 0 on success, -1 on error (call `minigraf_log_writer_last_error`).
+int minigraf_log_writer_append(struct MiniGrafLogWriter *writer, const char *record_json);
+
+// Append a JSON array of records in order, stopping at the first rejected one,
+// whose error ends with `(batch index N)`; the records before it stay
+// appended. Returns 0 on success, -1 on error.
+int minigraf_log_writer_append_batch(struct MiniGrafLogWriter *writer, const char *records_json);
+
+// Close the open transaction and raise the counter to `tx_count`.
+// Returns 0 on success, -1 on error.
+int minigraf_log_writer_advance_tx_count(struct MiniGrafLogWriter *writer, uint64_t tx_count);
+
+// The highest `tx_count` appended or advanced to, in `*out`. Returns 0 on
+// success, -1 on error.
+int minigraf_log_writer_tx_count(struct MiniGrafLogWriter *writer, uint64_t *out);
+
+// Commit every record and rename the file into place. The writer must still
+// be freed; later calls fail with API-018. Returns 0 on success, -1 on error.
+int minigraf_log_writer_finish(struct MiniGrafLogWriter *writer);
+
+// The error of the last call on the writer, or NULL if it had none. Valid
+// until the next call on the writer.
+const char *minigraf_log_writer_last_error(struct MiniGrafLogWriter *writer);
+
+// Free a writer. An unfinished build is abandoned and leaves no file.
+void minigraf_log_writer_free(struct MiniGrafLogWriter *writer);
 
 // Return the last error message. Valid until the next call on the same handle.
 // Returns NULL if no error has occurred.
