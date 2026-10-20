@@ -77,8 +77,13 @@ jobs:
             exit 1
           fi
 
+      # rustc would record the build directory as the dylib's install name, so
+      # programs linked against it look for the library on the CI runner.
+      # @rpath lets them find it through their own rpath, as the README says.
       - name: Build (universal2)
         if: matrix.target == 'universal2'
+        env:
+          RUSTFLAGS: -C link-arg=-Wl,-install_name,@rpath/libminigraf.dylib
         run: |
           cargo build --release --lib --target aarch64-apple-darwin
           cargo build --release --lib --target x86_64-apple-darwin
@@ -92,7 +97,10 @@ jobs:
           echo "archs: $ARCHS"
           [[ " $ARCHS " == *" x86_64 "* && " $ARCHS " == *" arm64 "* ]] \
             || { echo "::error::universal2 dylib lacks a slice"; exit 1; }
-          otool -D stage/libminigraf.dylib
+          ID=$(otool -D stage/libminigraf.dylib | tail -1)
+          echo "install name: $ID"
+          [ "$ID" = "@rpath/libminigraf.dylib" ] \
+            || { echo "::error::install name is $ID, not @rpath/libminigraf.dylib"; exit 1; }
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
