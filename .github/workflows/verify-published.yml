@@ -1,0 +1,78 @@
+name: Verify published
+
+# Downloads minigraf-c <version> from its GitHub Release, as a user would, and
+# runs the consumer test on every platform. A failure means a broken release is
+# public: the run fails and an issue labelled release-broken is opened (or
+# commented on, if one is open for this version).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Ref whose consumer-test/ to run (release.yml passes the release tag)'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published version (e.g. 2.0.9)'
+        required: true
+        type: string
+      ref:
+        description: 'Ref whose consumer-test/ to run (default: the branch dispatched from)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    name: Consumer test from the release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Run consumer test
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash consumer-test/run.sh registry ${{ inputs.version }}
+
+  report:
+    name: Report broken release
+    needs: verify
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open or update the release-broken issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create release-broken --repo "$REPO" --color B60205 \
+            --description "A published release does not install or run" --force
+          TITLE="v$VERSION published but unusable: consumer test failed (GitHub Release)"
+          BODY="The consumer test failed against the minigraf-c v$VERSION release archives. Run: $RUN_URL"
+          NUMBER=$(gh issue list --repo "$REPO" --label release-broken --state open \
+            --search "\"v$VERSION published\" in:title" --json number -q '.[0].number')
+          if [ -n "$NUMBER" ]; then
+            gh issue comment "$NUMBER" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --label bug --label release-broken --body "$BODY"
+          fi
