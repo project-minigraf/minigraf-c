@@ -80,6 +80,9 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.prepare.outputs.sha }}
+      # The archives are built and consumer-tested here with the release
+      # version in their names; publish uploads exactly these files.
+      version: ${{ needs.prepare.outputs.semver }}
 
   tag:
     name: Push tag and update main
@@ -129,94 +132,37 @@ jobs:
             --title "minigraf-c ${{ needs.prepare.outputs.tag }}" \
             --notes "C bindings for minigraf ${{ needs.prepare.outputs.tag }}. Download the library for your platform below."
 
-  build:
-    name: Build C library (${{ matrix.os }})
-    needs: [prepare, create-release]
-    runs-on: ${{ matrix.os }}
+  publish:
+    name: Upload the tested archives to the release
+    needs: [prepare, test, create-release]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact-name: linux-x86_64
-            lib-name: libminigraf.so
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact-name: linux-aarch64
-            lib-name: libminigraf.so
-          - os: macos-14
-            target: universal2
-            artifact-name: macos-universal2
-            lib-name: libminigraf.dylib
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact-name: windows-x86_64
-            lib-name: minigraf.dll
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target == 'universal2' && 'aarch64-apple-darwin x86_64-apple-darwin' || matrix.target }}
-
-      - name: Build (universal2)
-        if: matrix.target == 'universal2'
-        run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-          lipo -create \
-            target/aarch64-apple-darwin/release/libminigraf.dylib \
-            target/x86_64-apple-darwin/release/libminigraf.dylib \
-            -output ${{ matrix.lib-name }}
-
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/libminigraf.so ${{ matrix.lib-name }}
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-          copy target\${{ matrix.target }}\release\minigraf.dll ${{ matrix.lib-name }}
-        shell: pwsh
-
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        run: |
-          tar czf minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.tar.gz \
-            ${{ matrix.lib-name }} include/minigraf.h
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: |
-          Compress-Archive -Path ${{ matrix.lib-name }},include\minigraf.h `
-            -DestinationPath minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.zip
-        shell: pwsh
-
-      - name: Upload to GitHub Release (unix)
-        if: runner.os != 'Windows'
+      - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release upload "${{ needs.prepare.outputs.tag }}" \
-            minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --clobber
+          ls -l dist
+          [ "$(ls dist | wc -l)" -eq 4 ] || { echo "::error::expected 4 archives"; exit 1; }
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
-      - name: Upload to GitHub Release (windows)
-        if: runner.os == 'Windows'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ needs.prepare.outputs.tag }}" `
-            "minigraf-c-${{ needs.prepare.outputs.tag }}-${{ matrix.artifact-name }}.zip" `
-            --repo "$GITHUB_REPOSITORY" --clobber
-        shell: pwsh
-
+  # Downloads the published archives and runs the consumer test on every
+  # platform; on failure the run fails and a release-broken issue is opened.
+  verify-published:
+    name: Verify the published archives
+    needs: [prepare, publish]
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/verify-published.yml
+    with:
+      version: ${{ needs.prepare.outputs.semver }}
+      ref: ${{ needs.prepare.outputs.tag }}

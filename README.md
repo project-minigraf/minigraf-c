@@ -15,7 +15,10 @@ Download the pre-built library for your platform from the
 | macOS universal | `minigraf-c-<version>-macos-universal2.tar.gz` |
 | Windows x86_64 | `minigraf-c-<version>-windows-x86_64.zip` |
 
-Each archive contains `libminigraf.{so|dylib|dll}` and `minigraf.h`.
+Each archive contains the shared library (`libminigraf.so`, `libminigraf.dylib` or
+`minigraf.dll`), `include/minigraf.h` and the license files. The Windows archive also has
+`minigraf.dll.lib`, the import library MSVC links against. The Linux libraries need glibc
+2.17 or later.
 
 ## Quick start
 
@@ -33,7 +36,10 @@ int main(void) {
 }
 ```
 
-Compile: `cc -o example example.c -Iinclude -L. -lminigraf -Wl,-rpath,.`
+Compile, from the unpacked archive:
+
+- Linux and macOS: `cc -o example example.c -Iinclude -L. -lminigraf -Wl,-rpath,.`
+- Windows (MSVC): `cl /Iinclude example.c minigraf.dll.lib`, with `minigraf.dll` next to `example.exe`
 
 ## Memory contract
 
