@@ -1,0 +1,130 @@
+name: Package
+
+# Builds the release archives exactly as the release publishes them and uploads
+# each as dist-<platform>. Every archive has the same layout:
+#   <shared library>        libminigraf.so | libminigraf.dylib | minigraf.dll
+#   minigraf.dll.lib        Windows only: the import library MSVC links against
+#   include/minigraf.h
+#   LICENSE-MIT, LICENSE-APACHE
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ''
+      version:
+        required: true
+        type: string
+
+jobs:
+  archive:
+    name: Build archive (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux targets use cargo-zigbuild to pin glibc 2.17 instead of the
+          # runner's, so RHEL 8, Debian 11 etc. can load the library.
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            zig-target: x86_64-unknown-linux-gnu.2.17
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            zig-target: aarch64-unknown-linux-gnu.2.17
+          - os: macos-14
+            platform: macos-universal2
+            target: universal2
+          - os: windows-latest
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal2' && 'aarch64-apple-darwin x86_64-apple-darwin' || matrix.target }}
+
+      - uses: actions/setup-python@v5
+        if: matrix.zig-target
+        with:
+          python-version: '3.x'
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig-target
+        run: pip install ziglang cargo-zigbuild
+
+      - name: Build (Linux, zigbuild)
+        if: matrix.zig-target
+        run: |
+          cargo zigbuild --release --lib --target ${{ matrix.zig-target }}
+          mkdir -p stage
+          cp target/${{ matrix.target }}/release/libminigraf.so stage/
+
+      - name: Check glibc floor
+        if: matrix.zig-target
+        run: |
+          MAX=$(objdump -T stage/libminigraf.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "Highest required glibc: $MAX"
+          if [ "$(printf '%s\n2.17\n' "$MAX" | sort -V | tail -1)" != "2.17" ]; then
+            echo "::error::libminigraf.so requires glibc $MAX, above the 2.17 floor"
+            exit 1
+          fi
+
+      - name: Build (universal2)
+        if: matrix.target == 'universal2'
+        run: |
+          cargo build --release --lib --target aarch64-apple-darwin
+          cargo build --release --lib --target x86_64-apple-darwin
+          mkdir -p stage
+          lipo -create \
+            target/aarch64-apple-darwin/release/libminigraf.dylib \
+            target/x86_64-apple-darwin/release/libminigraf.dylib \
+            -output stage/libminigraf.dylib
+          # The x86_64 slice cannot run on an arm64 runner; check it is there.
+          ARCHS=$(lipo -archs stage/libminigraf.dylib)
+          echo "archs: $ARCHS"
+          [[ " $ARCHS " == *" x86_64 "* && " $ARCHS " == *" arm64 "* ]] \
+            || { echo "::error::universal2 dylib lacks a slice"; exit 1; }
+          otool -D stage/libminigraf.dylib
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --lib --target ${{ matrix.target }}
+          mkdir -p stage
+          cp target/${{ matrix.target }}/release/minigraf.dll target/${{ matrix.target }}/release/minigraf.dll.lib stage/
+
+      - name: Stage header and licenses
+        shell: bash
+        run: |
+          mkdir -p stage/include
+          cp include/minigraf.h stage/include/
+          cp LICENSE-MIT LICENSE-APACHE stage/
+          find stage -type f | sort
+
+      - name: Archive (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar czf "dist/minigraf-c-v${{ inputs.version }}-${{ matrix.platform }}.tar.gz" -C stage .
+
+      - name: Archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path stage\* -DestinationPath "dist\minigraf-c-v${{ inputs.version }}-${{ matrix.platform }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error

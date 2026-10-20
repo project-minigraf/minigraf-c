@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: 'Version in the archive names (release.yml passes the release version)'
+        required: false
+        type: string
+        default: '0.0.0-ci'
 
 jobs:
   test:
@@ -64,3 +69,43 @@ jobs:
         run: |
           diff include/minigraf.h /tmp/minigraf_generated.h || \
           (echo "minigraf.h is out of date — run cbindgen locally and commit the result" && exit 1)
+
+  package:
+    name: Package
+    uses: ./.github/workflows/package.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version || '0.0.0-ci' }}
+
+  # Unpacks this platform's archive and compiles and runs the README quick
+  # start and the consumer contract against it, as a user would.
+  consumer:
+    name: Consumer test (${{ matrix.os }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Run consumer test
+        shell: bash
+        run: bash consumer-test/run.sh local dist ${{ inputs.version || '0.0.0-ci' }}
+
+  readme-sync:
+    name: README quick start matches the consumer test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: python3 -I consumer-test/readme_sync.py README.md consumer-test/quickstart.c
