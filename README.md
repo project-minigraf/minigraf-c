@@ -64,7 +64,7 @@ Compile, from the unpacked archive:
 | `minigraf_checkpoint(db)` | Flush WAL to disk; returns 0 on success |
 | `minigraf_last_error(db)` | Return last error message (valid until next call) |
 | `minigraf_close(db)` | Close the database and free all memory |
-| `minigraf_open_with_options(path, options_json, &err)` | Open with options (`read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`, `max_derived_facts`, `max_results`, `synchronous`: `"full"`/`"normal"`); NULL options = defaults; on error returns NULL and stores the message in `err` |
+| `minigraf_open_with_options(path, options_json, &err)` | Open with options (`read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`, `max_derived_facts`, `max_results`, `synchronous`: `"full"`/`"normal"`, `query_memory_limit`: bytes one query may hold, else `QRY-012`, default no limit); NULL options = defaults; on error returns NULL and stores the message in `err` |
 | `minigraf_current_tx_count(db, &out)` | The transaction counter `:as-of N` compares against |
 | `minigraf_query(db, datalog)` | Open a cursor; its answer is fixed when it opens |
 | `minigraf_cursor_vars(c)` | The `:find` variables, as a JSON array |

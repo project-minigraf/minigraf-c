@@ -242,6 +242,7 @@ struct OpenOptionsJson {
     max_derived_facts: Option<usize>,
     max_results: Option<usize>,
     synchronous: Option<SyncModeJson>,
+    query_memory_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -270,7 +271,13 @@ impl OpenOptionsJson {
             o = o.max_derived_facts(v);
         }
         if let Some(v) = self.max_results {
-            o = o.max_results(v);
+            #[allow(deprecated)]
+            {
+                o = o.max_results(v);
+            }
+        }
+        if let Some(v) = self.query_memory_limit {
+            o = o.query_memory_limit(v);
         }
         if let Some(v) = self.synchronous {
             o = o.synchronous(match v {
@@ -288,8 +295,10 @@ fn open_options(options_json: *const c_char) -> Result<minigraf::OpenOptions, Mi
 
 /// Open a file-backed database with `options_json`, a JSON object with any of
 /// `read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`,
-/// `max_derived_facts`, `max_results` and `synchronous` (`"full"` or
-/// `"normal"`); NULL means all defaults. Returns NULL on error and, if
+/// `max_derived_facts`, `max_results` (a deprecated alias of
+/// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`) and
+/// `query_memory_limit` (the most bytes one query may hold, else `QRY-012`;
+/// default no limit); NULL means all defaults. Returns NULL on error and, if
 /// `error_out` is not NULL, stores the message there (free it with
 /// `minigraf_string_free`).
 #[unsafe(no_mangle)]
@@ -1132,6 +1141,30 @@ mod tests {
             minigraf_open_with_options(missing.as_ptr(), ro_opts.as_ptr(), std::ptr::null_mut())
                 .is_null()
         );
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn query_memory_limit_is_qry_012() {
+        let (file, path) = tmp("qml");
+        // A cartesian product holds one side in full.
+        let product = CString::new("(query [:find ?a ?b :where [?a :n _] [?b :m _]])").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        let small = CString::new(r#"{"query_memory_limit": 64}"#).unwrap();
+        let db = minigraf_open_with_options(path.as_ptr(), small.as_ptr(), &mut err);
+        assert!(!db.is_null() && err.is_null());
+        exec(db, "(transact [[:a :n 1] [:b :m 2]])");
+        assert!(minigraf_execute(db, product.as_ptr()).is_null());
+        assert!(text(minigraf_last_error(db)).starts_with("[QRY-012]"));
+        minigraf_close(db);
+
+        // SIZE_MAX is no limit, the default.
+        let max = CString::new(format!(r#"{{"query_memory_limit": {}}}"#, usize::MAX)).unwrap();
+        let db = minigraf_open_with_options(path.as_ptr(), max.as_ptr(), &mut err);
+        assert!(!db.is_null() && err.is_null());
+        assert!(take(minigraf_execute(db, product.as_ptr())).is_some());
+        minigraf_close(db);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

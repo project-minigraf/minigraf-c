@@ -14,7 +14,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 # Unreleased v3 core (format v8). At the v3.0.0 release this goes back to an exact
 # crates.io pin (minigraf = "=3.0.0"), which the release workflow updates.
-minigraf = { git = "https://github.com/project-minigraf/minigraf", rev = "97cd4a2a85301ea3478250dd654139d45a1f7cd0" }
+minigraf = { git = "https://github.com/project-minigraf/minigraf", rev = "df7282f1f3ad17628d33fa5488730201313ac268" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

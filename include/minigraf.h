@@ -38,8 +38,10 @@ int minigraf_checkpoint(struct MiniGrafDb *handle);
 
 // Open a file-backed database with `options_json`, a JSON object with any of
 // `read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`,
-// `max_derived_facts`, `max_results` and `synchronous` (`"full"` or
-// `"normal"`); NULL means all defaults. Returns NULL on error and, if
+// `max_derived_facts`, `max_results` (a deprecated alias of
+// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`) and
+// `query_memory_limit` (the most bytes one query may hold, else `QRY-012`;
+// default no limit); NULL means all defaults. Returns NULL on error and, if
 // `error_out` is not NULL, stores the message there (free it with
 // `minigraf_string_free`).
 struct MiniGrafDb *minigraf_open_with_options(const char *path,
