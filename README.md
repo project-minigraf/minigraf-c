@@ -46,9 +46,11 @@ Compile, from the unpacked archive:
 - Strings returned by `minigraf_execute`, `minigraf_cursor_vars`,
   `minigraf_cursor_next_batch` and `minigraf_fact_log_next_batch`, and messages stored
   in an `error_out`, must be freed with `minigraf_string_free`.
-- Databases must be closed with `minigraf_close`; cursors, fact logs and log writers
-  must be freed with `minigraf_cursor_free`, `minigraf_fact_log_free` and
-  `minigraf_log_writer_free`.
+- Databases must be closed with `minigraf_close`; cursors, fact logs, log writers and
+  prepared queries must be freed with `minigraf_cursor_free`, `minigraf_fact_log_free`,
+  `minigraf_log_writer_free` and `minigraf_prepared_free`. `minigraf_close` releases
+  the database's prepared queries (later calls fail with `API-018`), but each must
+  still be freed.
 - Strings returned by the `*_last_error` functions belong to the object and are valid
   until its next call. Every error message starts with its code, such as `[API-015]`.
 - Passing `NULL` to any function is safe (no-op or returns NULL/error).
@@ -79,6 +81,11 @@ Compile, from the unpacked archive:
 | `minigraf_log_writer_finish(w)` | Commit and rename the file into place; later calls fail with `API-018` |
 | `minigraf_log_writer_last_error(w)` | The error of the writer's last call |
 | `minigraf_log_writer_free(w)` | Free the writer; an unfinished build is abandoned and leaves no file |
+| `minigraf_prepare(db, datalog)` | Parse a query with `$slots` once; NULL on error (`minigraf_last_error`: `API-005`–`007` for a non-query, `API-023` for an attribute slot) |
+| `minigraf_prepared_execute(pq, bindings_json)` | Run it with `bindings_json` (see below; NULL = `{}`) and return JSON like `execute`; NULL on error (`minigraf_prepared_last_error`) |
+| `minigraf_prepared_query(pq, bindings_json)` | Run it and return a cursor |
+| `minigraf_prepared_last_error(pq)` | The error of its last call: `API-017` (bad bindings), `API-022` (missing slot), `API-024` (wrong kind), `API-018` (database closed) |
+| `minigraf_prepared_free(pq)` | Free a prepared query, also after `minigraf_close` |
 
 A fact record is `{"entity": "<uuid>", "attribute": ":a/b", "value": {"type": "string", "value": "x"},
 "tx_count": 1, "tx_id": 1700000000000, "valid_from": 1700000000000, "valid_to": 9223372036854775807,
@@ -86,6 +93,20 @@ A fact record is `{"entity": "<uuid>", "attribute": ":a/b", "value": {"type": "s
 `keyword` and `null` (no `value`), so a record is written back exactly. A `valid_to` of
 9223372036854775807 means forever. The batches `minigraf_fact_log_next_batch` returns can be passed
 straight to `minigraf_log_writer_append_batch`; see `tests/c/etl_smoke.c`.
+
+Bindings are a JSON object of slot name (without the `$`) to bind value: `true`/`false`, a
+number (an integer when it has no fraction or exponent, so `2` is an integer and `2.0` a float),
+a string, `null`, or a typed object: a value type above (`{"type": "keyword", "value": ":k"}`),
+`{"type": "entity", "value": "<uuid>"}`, `{"type": "txCount", "value": 5}` or
+`{"type": "timestamp", "value": 1700000000000}` for `:as-of`, and `{"type": "anyValidTime"}`
+for `:valid-at`.
+
+```c
+MiniGrafPrepared *pq = minigraf_prepare(db, "(query [:find ?n :where [?e :age $age] [?e :name ?n]])");
+char *thirty = minigraf_prepared_execute(pq, "{\"age\": 30}");
+minigraf_string_free(thirty);
+minigraf_prepared_free(pq);
+```
 
 ## Building from source
 

@@ -17,6 +17,8 @@ typedef struct MiniGrafFactLog MiniGrafFactLog;
 
 typedef struct MiniGrafLogWriter MiniGrafLogWriter;
 
+typedef struct MiniGrafPrepared MiniGrafPrepared;
+
 // Open a file-backed Minigraf database. Returns NULL on error.
 struct MiniGrafDb *minigraf_open(const char *path);
 
@@ -73,6 +75,40 @@ const char *minigraf_cursor_last_error(struct MiniGrafCursor *cursor);
 
 // Close a cursor and free it.
 void minigraf_cursor_free(struct MiniGrafCursor *cursor);
+
+// Parse and validate a `(query ...)` once, for running many times with
+// different bind values in its `$name` slots. Returns NULL on error (call
+// `minigraf_last_error` on `handle`): API-005/006/007 for a transact, retract
+// or rule, API-023 for a slot in an attribute position. Free it with
+// `minigraf_prepared_free`, also after `minigraf_close`.
+struct MiniGrafPrepared *minigraf_prepare(struct MiniGrafDb *handle, const char *datalog);
+
+// Run a prepared query with `bindings_json`, a JSON object of slot name
+// (without the `$`) to bind value; NULL means `{}`. A bind value is `true`/
+// `false`, a number (an integer when it has no fraction or exponent, else a
+// float), a string, `null`, or a typed object: `{"type": "integer" | "float" |
+// "string" | "boolean" | "keyword" | "ref" | "null", "value": ...}`,
+// `{"type": "entity", "value": uuid}`, `{"type": "txCount" | "timestamp",
+// "value": n}` or `{"type": "anyValidTime"}`. Returns the result as JSON,
+// encoded like `minigraf_execute`'s (free it with `minigraf_string_free`), or
+// NULL on error (call `minigraf_prepared_last_error`): API-017 for bindings
+// that are not bind values, API-022 for a missing slot, API-024 for a bind
+// value of the wrong kind, API-018 after `minigraf_close` of its database.
+char *minigraf_prepared_execute(struct MiniGrafPrepared *prepared, const char *bindings_json);
+
+// Run a prepared query with `bindings_json` (as `minigraf_prepared_execute`)
+// and return a cursor over its rows; its answer is fixed when it opens.
+// Returns NULL on error (call `minigraf_prepared_last_error`). Free the cursor
+// with `minigraf_cursor_free`.
+struct MiniGrafCursor *minigraf_prepared_query(struct MiniGrafPrepared *prepared,
+                                               const char *bindings_json);
+
+// The error of the last call on `prepared`, or NULL if it had none. Valid
+// until the next call on it.
+const char *minigraf_prepared_last_error(struct MiniGrafPrepared *prepared);
+
+// Free a prepared query. Call it also after `minigraf_close` of its database.
+void minigraf_prepared_free(struct MiniGrafPrepared *prepared);
 
 // Stream every fact record that `filter_json` keeps: a JSON object with any of
 // `attributes`, `attribute_prefixes`, `entities` (UUID strings), `tx_from` and
