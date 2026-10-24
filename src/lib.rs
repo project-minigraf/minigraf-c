@@ -714,14 +714,18 @@ fn typed_value(
         },
         "ref" => B::Val(Value::Ref(uuid(string()?)?)),
         "entity" => B::Entity(uuid(string()?)?),
-        "txCount" => {
-            let n = integer()?;
-            B::TxCount(
-                u64::try_from(n).map_err(|_| {
-                    MinigrafError::invalid_argument(format!("{what}: {n} is negative"))
-                })?,
-            )
-        }
+        "txCount" => match value {
+            Some(J::Number(n)) => match n.as_u64() {
+                Some(u) => B::TxCount(u),
+                None if n.as_i64().is_some() => {
+                    return Err(MinigrafError::invalid_argument(format!(
+                        "{what}: {n} is negative"
+                    )));
+                }
+                None => return Err(mismatch()),
+            },
+            _ => return Err(mismatch()),
+        },
         "timestamp" => B::Timestamp(integer()?),
         // These two take no value.
         "null" if value.is_none() => B::Val(Value::Null),
@@ -1723,12 +1727,33 @@ mod tests {
         run(pq, r#"{"n": 1}"#);
         assert!(minigraf_prepared_last_error(pq).is_null());
 
-        let attr = c("(query [:find ?v :where [?e $a ?v]])");
-        assert!(minigraf_prepare(db, attr.as_ptr()).is_null());
-        let e = unsafe { CStr::from_ptr(minigraf_last_error(db)) }
-            .to_str()
-            .unwrap();
-        assert!(e.starts_with("[API-023]"));
+        for (text, code) in [
+            ("(query [:find ?v :where [?e $a ?v]])", "[API-023]"),
+            ("(transact [[:a :n 1]])", "[API-005]"),
+            ("(retract [[:a :n 1]])", "[API-006]"),
+            ("(rule [(r ?x) [?x :n _]])", "[API-007]"),
+        ] {
+            let t = c(text);
+            assert!(
+                minigraf_prepare(db, t.as_ptr()).is_null(),
+                "{text} is not preparable"
+            );
+            let e = unsafe { CStr::from_ptr(minigraf_last_error(db)) }
+                .to_str()
+                .unwrap();
+            assert!(e.starts_with(code), "{text} gives {code}");
+        }
+        // A tx count may use the whole u64 range.
+        let as_of = c("(query [:find ?x :as-of $t :where [?e :n ?x]])");
+        let aq = minigraf_prepare(db, as_of.as_ptr());
+        assert!(
+            !run(
+                aq,
+                r#"{"t": {"type": "txCount", "value": 18446744073709551615}}"#
+            )
+            .is_empty()
+        );
+        minigraf_prepared_free(aq);
         minigraf_prepared_free(pq);
         minigraf_close(db);
     }
