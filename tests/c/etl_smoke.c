@@ -74,6 +74,36 @@ int main(int argc, char **argv) {
     CHECK(starts_with(err, "[STG-043]"), "STG-043");
     minigraf_string_free(err);
 
+    /* Prepared queries (minigraf#181). */
+    char p_path[4096];
+    snprintf(p_path, sizeof p_path, "%s/prepared.graph", argv[1]);
+    MiniGrafDb *pdb = minigraf_open(p_path);
+    CHECK(pdb != NULL, "open for prepare");
+    minigraf_string_free(minigraf_execute(pdb, "(transact [[:a :n 1] [:b :n 2]])"));
+    MiniGrafPrepared *pq = minigraf_prepare(pdb, "(query [:find ?x :where [?e :n $n] [?e :n ?x]])");
+    CHECK(pq != NULL, "prepare");
+    char *one = minigraf_prepared_execute(pq, "{\"n\": 1}");
+    CHECK(one != NULL && strstr(one, "\"results\":[[1]]") != NULL, "prepared n=1");
+    minigraf_string_free(one);
+    char *two = minigraf_prepared_execute(pq, "{\"n\": {\"type\": \"integer\", \"value\": 2}}");
+    CHECK(two != NULL && strstr(two, "\"results\":[[2]]") != NULL, "prepared n=2 typed");
+    minigraf_string_free(two);
+    MiniGrafCursor *pc = minigraf_prepared_query(pq, "{\"n\": 2}");
+    CHECK(pc != NULL, "prepared cursor");
+    char *pb = minigraf_cursor_next_batch(pc, 10);
+    CHECK(pb != NULL && strcmp(pb, "[[2]]") == 0, "prepared cursor rows");
+    minigraf_string_free(pb);
+    minigraf_cursor_free(pc);
+    CHECK(minigraf_prepared_execute(pq, "{}") == NULL, "missing slot refused");
+    CHECK(starts_with(minigraf_prepared_last_error(pq), "[API-022]"), "API-022");
+    minigraf_close(pdb);
+    CHECK(minigraf_prepared_execute(pq, "{\"n\": 1}") == NULL, "closed database refused");
+    CHECK(starts_with(minigraf_prepared_last_error(pq), "[API-018]"), "API-018");
+    MiniGrafDb *reopened = minigraf_open(p_path);
+    CHECK(reopened != NULL, "reopen after close with a prepared query alive");
+    minigraf_close(reopened);
+    minigraf_prepared_free(pq);
+
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

@@ -17,7 +17,7 @@ use minigraf::{MinigrafError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 /// The last error of an object, readable as a C string until the next call.
 #[derive(Default)]
@@ -88,6 +88,23 @@ fn to_c_json<T: Serialize>(value: &T) -> *mut c_char {
 pub struct MiniGrafDb {
     db: Mutex<minigraf::Minigraf>,
     last_error: Mutex<Option<CString>>,
+    /// Every prepared query made from this handle, emptied when it is closed
+    /// so that none keeps the file open.
+    prepared: Mutex<Vec<Weak<PreparedSlot>>>,
+}
+
+impl Drop for MiniGrafDb {
+    fn drop(&mut self) {
+        // A prepared query holds the file open too (core's PreparedQuery keeps
+        // the storage), so release every one before the database itself.
+        if let Ok(prepared) = self.prepared.get_mut() {
+            for slot in prepared.drain(..).filter_map(|w| w.upgrade()) {
+                if let Ok(mut q) = slot.lock() {
+                    *q = None;
+                }
+            }
+        }
+    }
 }
 
 impl MiniGrafDb {
@@ -122,6 +139,7 @@ pub extern "C" fn minigraf_open(path: *const c_char) -> *mut MiniGrafDb {
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
+            prepared: Mutex::default(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -134,6 +152,7 @@ pub extern "C" fn minigraf_open_in_memory() -> *mut MiniGrafDb {
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
+            prepared: Mutex::default(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -313,6 +332,7 @@ pub extern "C" fn minigraf_open_with_options(
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
+            prepared: Mutex::default(),
         })),
         Err(e) => {
             report(error_out, e.to_string());
@@ -448,6 +468,275 @@ pub extern "C" fn minigraf_cursor_free(cursor: *mut MiniGrafCursor) {
     if !cursor.is_null() {
         unsafe { drop(Box::from_raw(cursor)) };
     }
+}
+
+// ─── Prepared queries ─────────────────────────────────────────────────────────
+
+/// A prepared query, `None` once its database is closed.
+/// cbindgen:ignore
+type PreparedSlot = Mutex<Option<minigraf::PreparedQuery>>;
+
+pub struct MiniGrafPrepared {
+    slot: Arc<PreparedSlot>,
+    last_error: LastError,
+}
+
+/// Parse and validate a `(query ...)` once, for running many times with
+/// different bind values in its `$name` slots. Returns NULL on error (call
+/// `minigraf_last_error` on `handle`): API-005/006/007 for a transact, retract
+/// or rule, API-023 for a slot in an attribute position. Free it with
+/// `minigraf_prepared_free`, also after `minigraf_close`.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepare(
+    handle: *mut MiniGrafDb,
+    datalog: *const c_char,
+) -> *mut MiniGrafPrepared {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*handle };
+    let result = arg_str(datalog, "datalog")
+        .map_err(|e| e.to_string())
+        .and_then(|q| match handle.db.lock() {
+            Ok(db) => db.prepare(q).map_err(|e| e.to_string()),
+            Err(_) => Err("database lock poisoned".to_string()),
+        })
+        .and_then(|q| {
+            let slot = Arc::new(Mutex::new(Some(q)));
+            let mut prepared = handle
+                .prepared
+                .lock()
+                .map_err(|_| "database lock poisoned".to_string())?;
+            prepared.retain(|w| w.strong_count() > 0);
+            prepared.push(Arc::downgrade(&slot));
+            Ok(slot)
+        });
+    match result {
+        Ok(slot) => {
+            handle.clear_error();
+            Box::into_raw(Box::new(MiniGrafPrepared {
+                slot,
+                last_error: LastError::default(),
+            }))
+        }
+        Err(e) => {
+            handle.set_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Run a prepared query with `bindings_json`, a JSON object of slot name
+/// (without the `$`) to bind value; NULL means `{}`. A bind value is `true`/
+/// `false`, a number (an integer when it has no fraction or exponent, else a
+/// float), a string, `null`, or a typed object: `{"type": "integer" | "float" |
+/// "string" | "boolean" | "keyword" | "ref" | "null", "value": ...}`,
+/// `{"type": "entity", "value": uuid}`, `{"type": "txCount" | "timestamp",
+/// "value": n}` or `{"type": "anyValidTime"}`. Returns the result as JSON,
+/// encoded like `minigraf_execute`'s (free it with `minigraf_string_free`), or
+/// NULL on error (call `minigraf_prepared_last_error`): API-017 for bindings
+/// that are not bind values, API-022 for a missing slot, API-024 for a bind
+/// value of the wrong kind, API-018 after `minigraf_close` of its database.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_execute(
+    prepared: *mut MiniGrafPrepared,
+    bindings_json: *const c_char,
+) -> *mut c_char {
+    if prepared.is_null() {
+        return std::ptr::null_mut();
+    }
+    let prepared = unsafe { &*prepared };
+    match prepared.run(bindings_json, |q, b| q.execute(b)) {
+        Ok(result) => c_string(query_result_to_json(result)).into_raw(),
+        Err(()) => std::ptr::null_mut(),
+    }
+}
+
+/// Run a prepared query with `bindings_json` (as `minigraf_prepared_execute`)
+/// and return a cursor over its rows; its answer is fixed when it opens.
+/// Returns NULL on error (call `minigraf_prepared_last_error`). Free the cursor
+/// with `minigraf_cursor_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_query(
+    prepared: *mut MiniGrafPrepared,
+    bindings_json: *const c_char,
+) -> *mut MiniGrafCursor {
+    if prepared.is_null() {
+        return std::ptr::null_mut();
+    }
+    let prepared = unsafe { &*prepared };
+    match prepared.run(bindings_json, |q, b| q.query(b)) {
+        Ok(cursor) => Box::into_raw(Box::new(MiniGrafCursor {
+            vars: cursor.vars().to_vec(),
+            cursor: Mutex::new(Some(cursor)),
+            last_error: LastError::default(),
+        })),
+        Err(()) => std::ptr::null_mut(),
+    }
+}
+
+/// The error of the last call on `prepared`, or NULL if it had none. Valid
+/// until the next call on it.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_last_error(prepared: *mut MiniGrafPrepared) -> *const c_char {
+    if prepared.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &*prepared }.last_error.as_ptr()
+}
+
+/// Free a prepared query. Call it also after `minigraf_close` of its database.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_free(prepared: *mut MiniGrafPrepared) {
+    if !prepared.is_null() {
+        unsafe { drop(Box::from_raw(prepared)) };
+    }
+}
+
+impl MiniGrafPrepared {
+    /// Read the bindings and run `f`; on an error, set `last_error`.
+    fn run<T>(
+        &self,
+        bindings_json: *const c_char,
+        f: impl FnOnce(
+            &minigraf::PreparedQuery,
+            &[(&str, minigraf::BindValue)],
+        ) -> Result<T, MinigrafError>,
+    ) -> Result<T, ()> {
+        self.last_error.clear();
+        let result = read_bindings(bindings_json).and_then(|binds| {
+            let slice: Vec<(&str, minigraf::BindValue)> =
+                binds.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
+            let guard = self
+                .slot
+                .lock()
+                .map_err(|_| MinigrafError::invalid_argument("prepared query lock poisoned"))?;
+            let q = guard
+                .as_ref()
+                .ok_or_else(|| MinigrafError::closed("database"))?;
+            f(q, &slice)
+        });
+        result.map_err(|e| self.last_error.set(e.to_string()))
+    }
+}
+
+/// `bindings_json` as `(slot, bind value)` pairs; NULL means none.
+fn read_bindings(
+    bindings_json: *const c_char,
+) -> Result<Vec<(String, minigraf::BindValue)>, MinigrafError> {
+    if bindings_json.is_null() {
+        return Ok(Vec::new());
+    }
+    let text = arg_str(bindings_json, "bindings_json")?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| MinigrafError::invalid_argument(format!("bindings_json: {e}")))?;
+    let serde_json::Value::Object(map) = value else {
+        return Err(MinigrafError::invalid_argument(
+            "bindings_json must be a JSON object of slot name to bind value",
+        ));
+    };
+    map.into_iter()
+        .map(|(name, v)| {
+            let bind = bind_value(&name, &v)?;
+            Ok((name, bind))
+        })
+        .collect()
+}
+
+fn bind_value(name: &str, v: &serde_json::Value) -> Result<minigraf::BindValue, MinigrafError> {
+    use minigraf::BindValue as B;
+    use serde_json::Value as J;
+    let what = format!("slot ${name}");
+    Ok(match v {
+        J::Bool(b) => B::Val(Value::Boolean(*b)),
+        J::Null => B::Val(Value::Null),
+        J::String(s) => B::Val(Value::String(s.clone())),
+        J::Number(n) => B::Val(number(&what, n)?),
+        J::Object(o) => match o.get("type").and_then(J::as_str) {
+            Some(kind) => typed_value(&format!("{what} of type {kind:?}"), kind, o.get("value"))?,
+            None => return Err(not_a_bind_value(&what)),
+        },
+        J::Array(_) => return Err(not_a_bind_value(&what)),
+    })
+}
+
+fn not_a_bind_value(what: &str) -> MinigrafError {
+    MinigrafError::invalid_argument(format!(
+        "{what}: a bind value is a boolean, number, string, null or {{\"type\", \"value\"}} object"
+    ))
+}
+
+/// A JSON number: an integer when it has no fraction or exponent, else a float.
+fn number(what: &str, n: &serde_json::Number) -> Result<Value, MinigrafError> {
+    if let Some(i) = n.as_i64() {
+        Ok(Value::Integer(i))
+    } else if n.is_u64() {
+        Err(MinigrafError::invalid_argument(format!(
+            "{what}: {n} does not fit in a signed 64-bit integer"
+        )))
+    } else {
+        Ok(Value::Float(n.as_f64().unwrap_or(f64::NAN)))
+    }
+}
+
+fn typed_value(
+    what: &str,
+    kind: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<minigraf::BindValue, MinigrafError> {
+    use minigraf::BindValue as B;
+    use serde_json::Value as J;
+    let mismatch =
+        || MinigrafError::invalid_argument(format!("{what}: the value does not match the type"));
+    let string = || match value {
+        Some(J::String(s)) => Ok(s.clone()),
+        _ => Err(mismatch()),
+    };
+    let integer = || match value {
+        Some(J::Number(n)) => n.as_i64().ok_or_else(mismatch),
+        _ => Err(mismatch()),
+    };
+    let uuid = |s: String| {
+        minigraf::EntityId::parse_str(&s)
+            .map_err(|_| MinigrafError::invalid_argument(format!("{what}: {s:?} is not a UUID")))
+    };
+    Ok(match kind {
+        "string" => B::Val(Value::String(string()?)),
+        "keyword" => B::Val(Value::Keyword(string()?)),
+        "boolean" => match value {
+            Some(J::Bool(b)) => B::Val(Value::Boolean(*b)),
+            _ => return Err(mismatch()),
+        },
+        "integer" => B::Val(Value::Integer(integer()?)),
+        "float" => match value {
+            Some(J::Number(n)) => B::Val(Value::Float(n.as_f64().ok_or_else(mismatch)?)),
+            _ => return Err(mismatch()),
+        },
+        "ref" => B::Val(Value::Ref(uuid(string()?)?)),
+        "entity" => B::Entity(uuid(string()?)?),
+        "txCount" => match value {
+            Some(J::Number(n)) => match n.as_u64() {
+                Some(u) => B::TxCount(u),
+                None if n.as_i64().is_some() => {
+                    return Err(MinigrafError::invalid_argument(format!(
+                        "{what}: {n} is negative"
+                    )));
+                }
+                None => return Err(mismatch()),
+            },
+            _ => return Err(mismatch()),
+        },
+        "timestamp" => B::Timestamp(integer()?),
+        // These two take no value.
+        "null" if value.is_none() => B::Val(Value::Null),
+        "anyValidTime" if value.is_none() => B::AnyValidTime,
+        "null" | "anyValidTime" => return Err(mismatch()),
+        _ => {
+            return Err(MinigrafError::invalid_argument(format!(
+                "{what}: unknown bind value type"
+            )));
+        }
+    })
 }
 
 // ─── Fact records ─────────────────────────────────────────────────────────────
@@ -1255,5 +1544,246 @@ mod tests {
     #[test]
     fn close_null_is_safe() {
         minigraf_close(std::ptr::null_mut());
+    }
+
+    // ─── Prepared queries (minigraf#181) ─────────────────────────────────
+
+    fn c(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    fn prepared_err(pq: *mut MiniGrafPrepared) -> String {
+        let e = minigraf_prepared_last_error(pq);
+        assert!(!e.is_null(), "an error is set");
+        unsafe { CStr::from_ptr(e) }.to_str().unwrap().to_string()
+    }
+
+    fn seeded() -> *mut MiniGrafDb {
+        let db = minigraf_open_in_memory();
+        let tx = c(
+            r#"(transact [[:a :n 1] [:b :n 2] [:c :n 3] [:a :s "x"] [:a :f 2.5] [:a :w 2.0] [:a :t true] [:a :k :kw] [:a :z nil]])"#,
+        );
+        take(minigraf_execute(db, tx.as_ptr())).unwrap();
+        db
+    }
+
+    fn results(json: &str) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["results"].as_array().unwrap().clone()
+    }
+
+    fn run(pq: *mut MiniGrafPrepared, bindings: &str) -> Vec<serde_json::Value> {
+        let b = c(bindings);
+        let out = take(minigraf_prepared_execute(pq, b.as_ptr()));
+        results(&out.unwrap_or_else(|| panic!("execute failed: {}", prepared_err(pq))))
+    }
+
+    #[test]
+    fn prepared_query_runs_again_with_new_bindings() {
+        let db = seeded();
+        let q = c("(query [:find ?x :where [?e :n $n] [?e :n ?x]])");
+        let pq = minigraf_prepare(db, q.as_ptr());
+        assert!(!pq.is_null());
+        for n in 1..=3 {
+            assert_eq!(
+                run(pq, &format!(r#"{{"n": {n}}}"#)),
+                vec![serde_json::json!([n])]
+            );
+        }
+        assert!(run(pq, r#"{"n": 9}"#).is_empty());
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn every_plain_and_typed_value_binds() {
+        let db = seeded();
+        let a = minigraf::EntityId::new_v5(&minigraf::EntityId::NAMESPACE_OID, b":a").to_string();
+        for (q, binding) in [
+            ("(query [:find ?e :where [?e :n $v]])", "1".to_string()),
+            ("(query [:find ?e :where [?e :s $v]])", r#""x""#.to_string()),
+            ("(query [:find ?e :where [?e :f $v]])", "2.5".to_string()),
+            ("(query [:find ?e :where [?e :w $v]])", "2.0".to_string()),
+            ("(query [:find ?e :where [?e :t $v]])", "true".to_string()),
+            ("(query [:find ?e :where [?e :z $v]])", "null".to_string()),
+            (
+                "(query [:find ?e :where [?e :n $v]])",
+                r#"{"type": "integer", "value": 1}"#.to_string(),
+            ),
+            (
+                "(query [:find ?e :where [?e :w $v]])",
+                r#"{"type": "float", "value": 2}"#.to_string(),
+            ),
+            (
+                "(query [:find ?e :where [?e :k $v]])",
+                r#"{"type": "keyword", "value": ":kw"}"#.to_string(),
+            ),
+            (
+                "(query [:find ?e :where [?e :z $v]])",
+                r#"{"type": "null"}"#.to_string(),
+            ),
+            (
+                "(query [:find ?x :where [$v :n ?x]])",
+                format!(r#"{{"type": "entity", "value": "{a}"}}"#),
+            ),
+            (
+                "(query [:find ?x :where [$v :n ?x]])",
+                format!(r#"{{"type": "ref", "value": "{a}"}}"#),
+            ),
+            (
+                "(query [:find ?x :as-of $v :where [?e :n ?x]])",
+                r#"{"type": "txCount", "value": 1}"#.to_string(),
+            ),
+            (
+                "(query [:find ?x :as-of $v :where [?e :n ?x]])",
+                r#"{"type": "timestamp", "value": 9007199254740991}"#.to_string(),
+            ),
+            (
+                "(query [:find ?x :valid-at $v :where [:a :n ?x]])",
+                r#"{"type": "anyValidTime"}"#.to_string(),
+            ),
+        ] {
+            let qs = c(q);
+            let pq = minigraf_prepare(db, qs.as_ptr());
+            assert!(!pq.is_null(), "prepare");
+            assert!(
+                !run(pq, &format!(r#"{{"v": {binding}}}"#)).is_empty(),
+                "{binding} binds in {q}"
+            );
+            minigraf_prepared_free(pq);
+        }
+        // A JSON integer is an integer: 2 does not match the stored float 2.0.
+        let qs = c("(query [:find ?e :where [?e :w $v]])");
+        let pq = minigraf_prepare(db, qs.as_ptr());
+        assert!(run(pq, r#"{"v": 2}"#).is_empty());
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn prepared_cursor_matches_execute() {
+        let db = seeded();
+        let q = c("(query [:find ?e ?n :where [?e :n ?n] [(>= ?n $min)]])");
+        let pq = minigraf_prepare(db, q.as_ptr());
+        let expected = run(pq, r#"{"min": 2}"#);
+        let b = c(r#"{"min": 2}"#);
+        let cursor = minigraf_prepared_query(pq, b.as_ptr());
+        assert!(!cursor.is_null());
+        let mut seen = 0;
+        while let Some(batch) = take(minigraf_cursor_next_batch(cursor, 1)) {
+            seen += serde_json::from_str::<Vec<serde_json::Value>>(&batch)
+                .unwrap()
+                .len();
+        }
+        assert_eq!(seen, expected.len());
+        assert_eq!(seen, 2);
+        minigraf_cursor_free(cursor);
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn bad_bindings_and_bind_mistakes_are_reported() {
+        let db = seeded();
+        let q = c("(query [:find ?e :where [?e :n $n]])");
+        let pq = minigraf_prepare(db, q.as_ptr());
+        for (bindings, code) in [
+            ("{}", "[API-022]"),
+            (r#"{"n": {"type": "txCount", "value": 1}}"#, "[API-024]"),
+            (r#"{"n": {"type": "txCount", "value": -1}}"#, "[API-017]"),
+            (r#"{"n": {"type": "null", "value": 1}}"#, "[API-017]"),
+            (
+                r#"{"n": {"type": "entity", "value": "not-a-uuid"}}"#,
+                "[API-017]",
+            ),
+            (r#"{"n": {"type": "nonsense"}}"#, "[API-017]"),
+            (r#"{"n": [1]}"#, "[API-017]"),
+            (r#"{"n": 9223372036854775808}"#, "[API-017]"),
+            ("[1]", "[API-017]"),
+            ("{not json", "[API-017]"),
+        ] {
+            let b = c(bindings);
+            assert!(
+                minigraf_prepared_execute(pq, b.as_ptr()).is_null(),
+                "{bindings} is refused"
+            );
+            assert!(
+                prepared_err(pq).starts_with(code),
+                "{bindings} gives {code}"
+            );
+            assert!(
+                minigraf_prepared_query(pq, b.as_ptr()).is_null(),
+                "query refuses {bindings}"
+            );
+            assert!(
+                prepared_err(pq).starts_with(code),
+                "query: {bindings} gives {code}"
+            );
+        }
+        // NULL bindings mean none.
+        assert!(minigraf_prepared_execute(pq, std::ptr::null()).is_null());
+        assert!(prepared_err(pq).starts_with("[API-022]"));
+        // A success clears the error.
+        run(pq, r#"{"n": 1}"#);
+        assert!(minigraf_prepared_last_error(pq).is_null());
+
+        for (text, code) in [
+            ("(query [:find ?v :where [?e $a ?v]])", "[API-023]"),
+            ("(transact [[:a :n 1]])", "[API-005]"),
+            ("(retract [[:a :n 1]])", "[API-006]"),
+            ("(rule [(r ?x) [?x :n _]])", "[API-007]"),
+        ] {
+            let t = c(text);
+            assert!(
+                minigraf_prepare(db, t.as_ptr()).is_null(),
+                "{text} is not preparable"
+            );
+            let e = unsafe { CStr::from_ptr(minigraf_last_error(db)) }
+                .to_str()
+                .unwrap();
+            assert!(e.starts_with(code), "{text} gives {code}");
+        }
+        // A tx count may use the whole u64 range.
+        let as_of = c("(query [:find ?x :as-of $t :where [?e :n ?x]])");
+        let aq = minigraf_prepare(db, as_of.as_ptr());
+        assert!(
+            !run(
+                aq,
+                r#"{"t": {"type": "txCount", "value": 18446744073709551615}}"#
+            )
+            .is_empty()
+        );
+        minigraf_prepared_free(aq);
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn close_releases_prepared_queries_so_the_path_reopens() {
+        let dir = std::env::temp_dir().join(format!("minigraf_c_prepared_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = c(dir.join("p.graph").to_str().unwrap());
+        let db = minigraf_open(path.as_ptr());
+        let tx = c("(transact [[:a :n 1]])");
+        take(minigraf_execute(db, tx.as_ptr())).unwrap();
+        let q = c("(query [:find ?e :where [?e :n $n]])");
+        let pq = minigraf_prepare(db, q.as_ptr());
+        minigraf_close(db);
+
+        let b = c(r#"{"n": 1}"#);
+        assert!(minigraf_prepared_execute(pq, b.as_ptr()).is_null());
+        assert!(prepared_err(pq).starts_with("[API-018]"));
+        assert!(minigraf_prepared_query(pq, b.as_ptr()).is_null());
+        assert!(prepared_err(pq).starts_with("[API-018]"));
+
+        let again = minigraf_open(path.as_ptr());
+        assert!(
+            !again.is_null(),
+            "the prepared query no longer holds the file"
+        );
+        minigraf_close(again);
+        minigraf_prepared_free(pq);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

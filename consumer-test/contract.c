@@ -46,7 +46,21 @@ int main(int argc, char **argv) {
     check(err != NULL && err[0] != '\0', "invalid Datalog sets minigraf_last_error");
     if (err) printf("  %s\n", err);
     minigraf_string_free(bad);
+
+    check(transact(mem, "(transact [[:bob :name \"Bob\"]])"), "transact Bob");
+    MiniGrafPrepared *pq = minigraf_prepare(mem, "(query [:find ?n :where [?e :name $name] [?e :name ?n]])");
+    check(pq != NULL, "prepare");
+    char *a = minigraf_prepared_execute(pq, "{\"name\": \"Alice\"}");
+    check(a != NULL && strstr(a, "[[\"Alice\"]]") != NULL, "prepared query finds Alice");
+    char *b = minigraf_prepared_execute(pq, "{\"name\": \"Bob\"}");
+    check(b != NULL && strstr(b, "[[\"Bob\"]]") != NULL, "prepared query finds Bob");
+    char *t = minigraf_prepared_execute(pq, "{\"name\": {\"type\": \"string\", \"value\": \"Alice\"}}");
+    check(t != NULL && strstr(t, "[[\"Alice\"]]") != NULL, "prepared query takes a typed value");
+    minigraf_string_free(a);
+    minigraf_string_free(b);
+    minigraf_string_free(t);
     minigraf_close(mem);
+    minigraf_prepared_free(pq);
 
     char path[4096];
     snprintf(path, sizeof path, "%s/test.graph", argv[1]);
