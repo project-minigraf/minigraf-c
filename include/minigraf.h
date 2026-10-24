@@ -89,7 +89,9 @@ struct MiniGrafPrepared *minigraf_prepare(struct MiniGrafDb *handle, const char 
 // float), a string, `null`, or a typed object: `{"type": "integer" | "float" |
 // "string" | "boolean" | "keyword" | "ref" | "null", "value": ...}`,
 // `{"type": "entity", "value": uuid}`, `{"type": "txCount" | "timestamp",
-// "value": n}` or `{"type": "anyValidTime"}`. Returns the result as JSON,
+// "value": n}`, `{"type": "anyValidTime"}`, or `{"type": "set", "value":
+// [...]}`, a set of plain values and typed value objects (minigraf#316; a set
+// inside a set is API-021). Returns the result as JSON,
 // encoded like `minigraf_execute`'s (free it with `minigraf_string_free`), or
 // NULL on error (call `minigraf_prepared_last_error`): API-017 for bindings
 // that are not bind values, API-022 for a missing slot, API-024 for a bind

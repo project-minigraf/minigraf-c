@@ -99,7 +99,11 @@ number (an integer when it has no fraction or exponent, so `2` is an integer and
 a string, `null`, or a typed object: a value type above (`{"type": "keyword", "value": ":k"}`),
 `{"type": "entity", "value": "<uuid>"}`, `{"type": "txCount", "value": 5}` or
 `{"type": "timestamp", "value": 1700000000000}` for `:as-of`, and `{"type": "anyValidTime"}`
-for `:valid-at`.
+for `:valid-at`. A set, for `in?` and the other set predicates or a set-valued attribute, is
+`{"type": "set", "value": [1, 2, {"type": "keyword", "value": ":k"}]}`: its elements are plain
+values or typed value objects. An element of another kind is `API-017` and a set inside a set
+`API-021`; a plain array is not a set. Set values come back as JSON arrays from
+`minigraf_execute` and as `{"type": "set", "value": [...]}` in fact records.
 
 ```c
 MiniGrafPrepared *pq = minigraf_prepare(db, "(query [:find ?n :where [?e :age $age] [?e :name ?n]])");

@@ -532,7 +532,9 @@ pub extern "C" fn minigraf_prepare(
 /// float), a string, `null`, or a typed object: `{"type": "integer" | "float" |
 /// "string" | "boolean" | "keyword" | "ref" | "null", "value": ...}`,
 /// `{"type": "entity", "value": uuid}`, `{"type": "txCount" | "timestamp",
-/// "value": n}` or `{"type": "anyValidTime"}`. Returns the result as JSON,
+/// "value": n}`, `{"type": "anyValidTime"}`, or `{"type": "set", "value":
+/// [...]}`, a set of plain values and typed value objects (minigraf#316; a set
+/// inside a set is API-021). Returns the result as JSON,
 /// encoded like `minigraf_execute`'s (free it with `minigraf_string_free`), or
 /// NULL on error (call `minigraf_prepared_last_error`): API-017 for bindings
 /// that are not bind values, API-022 for a missing slot, API-024 for a bind
@@ -653,7 +655,12 @@ fn bind_value(name: &str, v: &serde_json::Value) -> Result<minigraf::BindValue, 
         J::String(s) => B::Val(Value::String(s.clone())),
         J::Number(n) => B::Val(number(&what, n)?),
         J::Object(o) => match o.get("type").and_then(J::as_str) {
-            Some(kind) => typed_value(&format!("{what} of type {kind:?}"), kind, o.get("value"))?,
+            Some(kind) => typed_value(
+                name,
+                &format!("{what} of type {kind:?}"),
+                kind,
+                o.get("value"),
+            )?,
             None => return Err(not_a_bind_value(&what)),
         },
         J::Array(_) => return Err(not_a_bind_value(&what)),
@@ -680,6 +687,7 @@ fn number(what: &str, n: &serde_json::Number) -> Result<Value, MinigrafError> {
 }
 
 fn typed_value(
+    name: &str,
     what: &str,
     kind: &str,
     value: Option<&serde_json::Value>,
@@ -727,6 +735,22 @@ fn typed_value(
             _ => return Err(mismatch()),
         },
         "timestamp" => B::Timestamp(integer()?),
+        "set" => match value {
+            Some(J::Array(elements)) => {
+                let values = elements
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| match bind_value(&format!("{name}[{i}]"), e)? {
+                        B::Val(v) => Ok(v),
+                        _ => Err(MinigrafError::invalid_argument(format!(
+                            "{what}: element {i} is not a value"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                B::Val(Value::Set(minigraf::ValueSet::new(values)?))
+            }
+            _ => return Err(mismatch()),
+        },
         // These two take no value.
         "null" if value.is_none() => B::Val(Value::Null),
         "anyValidTime" if value.is_none() => B::AnyValidTime,
@@ -742,8 +766,9 @@ fn typed_value(
 // ─── Fact records ─────────────────────────────────────────────────────────────
 
 /// A value with its type kept: `{"type": "string", "value": "x"}`, with types
-/// `string`, `integer`, `float`, `boolean`, `ref` (a UUID string), `keyword`
-/// and `null` (no `value`).
+/// `string`, `integer`, `float`, `boolean`, `ref` (a UUID string), `keyword`,
+/// `null` (no `value`) and `set` (`value` an array of typed values, none a set,
+/// in canonical order; minigraf#316).
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "lowercase")]
 enum ValueJson {
@@ -754,6 +779,7 @@ enum ValueJson {
     Ref(String),
     Keyword(String),
     Null,
+    Set(Vec<ValueJson>),
 }
 
 impl From<Value> for ValueJson {
@@ -766,6 +792,9 @@ impl From<Value> for ValueJson {
             Value::Ref(id) => ValueJson::Ref(id.to_string()),
             Value::Keyword(k) => ValueJson::Keyword(k),
             Value::Null => ValueJson::Null,
+            Value::Set(set) => ValueJson::Set(set.iter().cloned().map(ValueJson::from).collect()),
+            // A value kind newer than this binding: its debug form.
+            other => ValueJson::String(format!("{other:?}")),
         }
     }
 }
@@ -785,6 +814,12 @@ impl ValueJson {
             ValueJson::Ref(s) => Value::Ref(parse_uuid(s, "ref value")?),
             ValueJson::Keyword(k) => Value::Keyword(k.clone()),
             ValueJson::Null => Value::Null,
+            ValueJson::Set(elements) => Value::Set(minigraf::ValueSet::new(
+                elements
+                    .iter()
+                    .map(ValueJson::to_core)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?),
         })
     }
 }
@@ -1212,6 +1247,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Ref(u) => J::String(u.to_string()),
         Value::Keyword(k) => J::String(k.clone()),
         Value::Null => J::Null,
+        Value::Set(set) => J::Array(set.iter().map(value_to_json).collect()),
+        // A value kind newer than this binding: its debug form.
+        other => J::String(format!("{other:?}")),
     }
 }
 
@@ -1785,5 +1823,105 @@ mod tests {
         minigraf_close(again);
         minigraf_prepared_free(pq);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── Sets (minigraf#316) ─────────────────────────────────────────────
+
+    #[test]
+    fn sets_bind_and_come_back_as_arrays() {
+        let db = seeded();
+        exec(db, r#"(transact [[:a :tags #{1 :k "x"}]])"#);
+        let q = c("(query [:find ?e :where [?e :n ?n] [(in? ?n $s)]])");
+        let member = minigraf_prepare(db, q.as_ptr());
+        for (b, want) in [
+            (r#"{"s": {"type": "set", "value": [1, 3]}}"#, 2),
+            (r#"{"s": {"type": "set", "value": [2, 2]}}"#, 1),
+            (r#"{"s": {"type": "set", "value": []}}"#, 0),
+        ] {
+            assert_eq!(run(member, b).len(), want, "{b}");
+        }
+        let q = c("(query [:find ?x :where [?e :tags $s] [?e :n ?x]])");
+        let equal = minigraf_prepare(db, q.as_ptr());
+        let tags =
+            r#"{"s": {"type": "set", "value": [{"type": "keyword", "value": ":k"}, 1, "x"]}}"#;
+        assert_eq!(run(equal, tags), vec![serde_json::json!([1])]);
+        assert!(
+            run(equal, r#"{"s": {"type": "set", "value": [":k", 1, "x"]}}"#).is_empty(),
+            "a string is no keyword"
+        );
+        let q = c("(query [:find ?t :where [:a :tags ?t]])");
+        let out = take(minigraf_execute(db, q.as_ptr())).unwrap();
+        assert_eq!(results(&out), vec![serde_json::json!([["x", 1, ":k"]])]);
+        minigraf_prepared_free(member);
+        minigraf_prepared_free(equal);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn bad_sets_are_rejected() {
+        let db = seeded();
+        let q = c("(query [:find ?e :where [?e :n ?n] [(in? ?n $s)]])");
+        let pq = minigraf_prepare(db, q.as_ptr());
+        let a = minigraf::EntityId::new_v5(&minigraf::EntityId::NAMESPACE_OID, b":a").to_string();
+        let entity = format!(
+            r#"{{"s": {{"type": "set", "value": [{{"type": "entity", "value": "{a}"}}]}}}}"#
+        );
+        for (bindings, code) in [
+            (
+                r#"{"s": {"type": "set", "value": [{"type": "set", "value": [1]}]}}"#,
+                "[API-021]",
+            ),
+            (entity.as_str(), "[API-017]"),
+            (
+                r#"{"s": {"type": "set", "value": [{"type": "anyValidTime"}]}}"#,
+                "[API-017]",
+            ),
+            (r#"{"s": {"type": "set", "value": [[1]]}}"#, "[API-017]"),
+            (r#"{"s": {"type": "set", "value": 1}}"#, "[API-017]"),
+            (r#"{"s": {"type": "set"}}"#, "[API-017]"),
+            (r#"{"s": [1]}"#, "[API-017]"),
+        ] {
+            let b = c(bindings);
+            assert!(
+                minigraf_prepared_execute(pq, b.as_ptr()).is_null(),
+                "{bindings} is refused"
+            );
+            assert!(
+                prepared_err(pq).starts_with(code),
+                "{bindings} gives {code}"
+            );
+        }
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn set_value_json_round_trips() {
+        let id = minigraf::EntityId::new_v5(&minigraf::EntityId::NAMESPACE_OID, b":a");
+        let set = minigraf::ValueSet::new([
+            Value::Integer(1),
+            Value::Keyword(":k".into()),
+            Value::Ref(id),
+        ])
+        .unwrap();
+        let json = serde_json::to_value(ValueJson::from(Value::Set(set.clone()))).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "set", "value": [
+                {"type": "integer", "value": 1},
+                {"type": "keyword", "value": ":k"},
+                {"type": "ref", "value": id.to_string()},
+            ]})
+        );
+        let back: ValueJson = serde_json::from_value(json).unwrap();
+        assert!(
+            back.to_core().unwrap() == Value::Set(set),
+            "set changed in round trip"
+        );
+        let nested: ValueJson = serde_json::from_value(
+            serde_json::json!({"type": "set", "value": [{"type": "set", "value": []}]}),
+        )
+        .unwrap();
+        assert_eq!(nested.to_core().err().unwrap().code(), "API-021");
     }
 }
