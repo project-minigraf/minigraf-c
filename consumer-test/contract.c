@@ -14,12 +14,16 @@ static void check(int ok, const char *what) {
 }
 
 /* Runs a query and reports whether its JSON result contains `want`. */
-static int query_has(MiniGrafDb *db, const char *want) {
-    char *r = minigraf_execute(db, "(query [:find ?n :where [?e :name ?n]])");
+static int query_has_q(MiniGrafDb *db, const char *query, const char *want) {
+    char *r = minigraf_execute(db, query);
     int found = r != NULL && strstr(r, want) != NULL;
     if (r) printf("  %s\n", r);
     minigraf_string_free(r);
     return found;
+}
+
+static int query_has(MiniGrafDb *db, const char *want) {
+    return query_has_q(db, "(query [:find ?n :where [?e :name ?n]])", want);
 }
 
 static int transact(MiniGrafDb *db, const char *datalog) {
@@ -59,6 +63,16 @@ int main(int argc, char **argv) {
     minigraf_string_free(a);
     minigraf_string_free(b);
     minigraf_string_free(t);
+
+    check(transact(mem, "(transact [[:alice :tags #{1 \"x\"}]])"), "transact a set");
+    check(query_has_q(mem, "(query [:find ?t :where [?e :tags ?t]])", "[[[\"x\",1]]]"),
+          "a set value comes back as an array");
+    MiniGrafPrepared *member = minigraf_prepare(mem, "(query [:find ?t :where [?e :tags ?t] [(in? 1 $s)]])");
+    char *m = minigraf_prepared_execute(member, "{\"s\": {\"type\": \"set\", \"value\": [1, 2]}}");
+    check(m != NULL && strstr(m, "[[[\"x\",1]]]") != NULL, "a set binds");
+    minigraf_string_free(m);
+    minigraf_prepared_free(member);
+
     minigraf_close(mem);
     minigraf_prepared_free(pq);
 
