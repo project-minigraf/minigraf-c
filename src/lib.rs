@@ -1909,8 +1909,8 @@ mod tests {
             json,
             serde_json::json!({"type": "set", "value": [
                 {"type": "integer", "value": 1},
-                {"type": "keyword", "value": ":k"},
                 {"type": "ref", "value": id.to_string()},
+                {"type": "keyword", "value": ":k"},
             ]})
         );
         let back: ValueJson = serde_json::from_value(json).unwrap();
