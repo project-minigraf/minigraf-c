@@ -26,6 +26,44 @@ static int query_has(MiniGrafDb *db, const char *want) {
     return query_has_q(db, "(query [:find ?n :where [?e :name ?n]])", want);
 }
 
+/* adult?: 1 for an integer of at least 18, 0 for a smaller one; any other
+ * value fails the call. */
+static int adult(MiniGrafUdfContext *ctx, void *user_data, const char *value_json) {
+    (void)user_data;
+    long long n;
+    if (sscanf(value_json, "{\"type\":\"integer\",\"value\":%lld}", &n) != 1) {
+        minigraf_udf_error(ctx, "not an integer");
+        return -1;
+    }
+    return n >= 18;
+}
+
+/* product: the product of a group's integers. */
+static int destroyed = 0;
+static void count_destroy(void *user_data) { (void)user_data; destroyed++; }
+static void *product_new(MiniGrafUdfContext *ctx, void *user_data) {
+    (void)ctx; (void)user_data;
+    long long *acc = malloc(sizeof *acc);
+    if (acc) *acc = 1;
+    return acc;
+}
+static int product_step(MiniGrafUdfContext *ctx, void *acc, const char *value_json) {
+    long long n;
+    if (sscanf(value_json, "{\"type\":\"integer\",\"value\":%lld}", &n) != 1) {
+        minigraf_udf_error(ctx, "not an integer");
+        return -1;
+    }
+    *(long long *)acc *= n;
+    return 0;
+}
+static int product_finish(MiniGrafUdfContext *ctx, void *acc, int64_t count) {
+    (void)count;
+    char json[64];
+    snprintf(json, sizeof json, "{\"type\":\"integer\",\"value\":%lld}", *(long long *)acc);
+    minigraf_udf_result(ctx, json);
+    return 0;
+}
+
 static int transact(MiniGrafDb *db, const char *datalog) {
     char *r = minigraf_execute(db, datalog);
     int ok = r != NULL && strstr(r, "\"transacted\"") != NULL;
@@ -73,8 +111,28 @@ int main(int argc, char **argv) {
     minigraf_string_free(m);
     minigraf_prepared_free(member);
 
+    check(transact(mem, "(transact [[:p :age 30] [:q :age 12] [:r :age 2]])"), "transact ages");
+    check(minigraf_register_predicate(mem, "adult?", adult, NULL, count_destroy) == 0,
+          "register a predicate");
+    check(query_has_q(mem, "(query [:find ?a :where [?e :age ?a] [(adult? ?a)]])", "[[30]]"),
+          "a predicate filters rows");
+    check(minigraf_register_aggregate(mem, "product", product_new, product_step, product_finish,
+                                      free, NULL, count_destroy) == 0,
+          "register an aggregate");
+    check(query_has_q(mem, "(query [:find (product ?a) :where [?e :age ?a]])", "[[720]]"),
+          "an aggregate in :find");
+    check(transact(mem, "(transact [[:s :age \"old\"]])"), "transact a string age");
+    char *failed = minigraf_execute(mem, "(query [:find ?a :where [?e :age ?a] [(adult? ?a)]])");
+    const char *udf_err = minigraf_last_error(mem);
+    check(failed == NULL && udf_err != NULL && strstr(udf_err, "QRY-014") != NULL
+              && strstr(udf_err, "not an integer") != NULL,
+          "a failing call is QRY-014");
+    if (udf_err) printf("  %s\n", udf_err);
+    minigraf_string_free(failed);
+
     minigraf_close(mem);
     minigraf_prepared_free(pq);
+    check(destroyed == 2, "close runs each function's destroy");
 
     char path[4096];
     snprintf(path, sizeof path, "%s/test.graph", argv[1]);
