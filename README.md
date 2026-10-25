@@ -86,6 +86,9 @@ Compile, from the unpacked archive:
 | `minigraf_prepared_query(pq, bindings_json)` | Run it and return a cursor |
 | `minigraf_prepared_last_error(pq)` | The error of its last call: `API-017` (bad bindings), `API-022` (missing slot), `API-024` (wrong kind), `API-018` (database closed) |
 | `minigraf_prepared_free(pq)` | Free a prepared query, also after `minigraf_close` |
+| `minigraf_register_predicate(db, name, f, user_data, destroy)` | Register a predicate (see User functions); 0 on success, -1 on error (`minigraf_last_error`) |
+| `minigraf_register_aggregate(db, name, init, step, finish, acc_free, user_data, destroy)` | Register an aggregate |
+| `minigraf_udf_error(ctx, message)` / `minigraf_udf_result(ctx, value_json)` | From inside a callback: fail the call / set `finish`'s result |
 
 A fact record is `{"entity": "<uuid>", "attribute": ":a/b", "value": {"type": "string", "value": "x"},
 "tx_count": 1, "tx_id": 1700000000000, "valid_from": 1700000000000, "valid_to": 9223372036854775807,
@@ -111,6 +114,84 @@ char *thirty = minigraf_prepared_execute(pq, "{\"age\": 30}");
 minigraf_string_free(thirty);
 minigraf_prepared_free(pq);
 ```
+
+## User functions
+
+Specified in minigraf's
+[`docs/superpowers/specs/2026-10-24-udf-uniffi-design.md`](https://github.com/project-minigraf/minigraf/blob/v3/docs/superpowers/specs/2026-10-24-udf-uniffi-design.md)
+§6.2. As with SQLite's `sqlite3_create_function`, a function is a function pointer, a
+`void *user_data` and an optional destructor, and a callback sets its result or error
+through a `MiniGrafUdfContext`, so no string ownership crosses the boundary.
+
+```c
+/* adult?: 1 true, 0 false, -1 failed. */
+static int adult(MiniGrafUdfContext *ctx, void *user_data, const char *value_json) {
+    long long n;
+    if (sscanf(value_json, "{\"type\":\"integer\",\"value\":%lld}", &n) != 1) {
+        minigraf_udf_error(ctx, "not an integer");
+        return -1;
+    }
+    return n >= 18;
+}
+
+/* product: one accumulator per group, freed with acc_free (here free). */
+static void *product_new(MiniGrafUdfContext *ctx, void *user_data) {
+    long long *acc = malloc(sizeof *acc);
+    if (acc) *acc = 1;
+    return acc; /* NULL fails the call */
+}
+static int product_step(MiniGrafUdfContext *ctx, void *acc, const char *value_json) {
+    long long n;
+    if (sscanf(value_json, "{\"type\":\"integer\",\"value\":%lld}", &n) != 1) return -1;
+    *(long long *)acc *= n;
+    return 0;
+}
+static int product_finish(MiniGrafUdfContext *ctx, void *acc, int64_t count) {
+    char json[64];
+    snprintf(json, sizeof json, "{\"type\":\"integer\",\"value\":%lld}", *(long long *)acc);
+    minigraf_udf_result(ctx, json);
+    return 0;
+}
+
+minigraf_register_predicate(db, "adult?", adult, NULL, NULL);
+minigraf_register_aggregate(db, "product", product_new, product_step, product_finish,
+                            free, NULL, NULL);
+char *r = minigraf_execute(db,
+    "(query [:find (product ?a) :where [?e :age ?a] [(adult? ?a)]])");
+```
+
+- A predicate is called in Datalog as `[(name ?v)]` and returns 1 (true), 0 (false) or -1
+  (failed). An aggregate is used as `(name ?v)` in `:find` or with `:over`: `init` makes one
+  accumulator per group or window partition, `step` adds a value (0 ok, -1 failed) and
+  `finish(ctx, acc, count)` sets the aggregate with `minigraf_udf_result` (0 ok, -1 failed),
+  where `count` is the number of values stepped. An aggregate steps a group's non-`nil`
+  values and gets `nil` with none; a window steps every value and calls `finish` once per
+  set of peer rows.
+- **Values** cross as typed JSON, the fact records' `{"type": "integer", "value": 30}` form
+  (sets as `{"type": "set", "value": [...]}`). `value_json` is valid during the call only.
+- **Failures.** A failing call stops the query with `QRY-014`, whose message is the one given
+  to `minigraf_udf_error`; it is never read as false or a missing value. The call fails when
+  the callback calls `minigraf_udf_error`, whatever it then returns; when it returns -1
+  (message `user function failed`); when it returns any other code it does not define; when
+  `init` returns NULL; and when `finish` sets no result, JSON that is not a typed value, or a
+  `ref` whose value is not a UUID. A `ctx` is valid only during the call it was passed to.
+- **Lifecycle.** `destroy(user_data)`, if not NULL, runs when the last reference to the
+  function drops: after `minigraf_close` and after every cursor, fact log and prepared query
+  from the database is freed. Until then `user_data` must stay valid. A registration that
+  fails (`API-017` for a NULL argument, `INT-040` for a name that is taken) runs `destroy`
+  before it returns. `acc_free(acc)`, if not NULL, runs when the query drops the accumulator:
+  after `finish`, on an error, or at an early `minigraf_cursor_free`. There is no
+  unregister. Predicates and aggregates have separate names. A query sees the functions
+  registered when it opened.
+- **Threading.** A callback runs on the thread that calls `minigraf_execute`,
+  `minigraf_cursor_next_batch` or a prepared query's execute or cursor. Queries on different
+  threads may call the same function at once, so the callbacks and `user_data` must be safe to
+  use from any thread that queries the database. One accumulator is used by one query on one
+  thread at a time. `destroy` and `acc_free` run on the thread that drops the last reference.
+- **Cost.** Each call is one C function call and one JSON encoding of the value.
+- **Re-entry.** A callback may query the same database, open a cursor, write, or register
+  another function: no lock of the handle is held while the core runs. A callback must not
+  close the database it runs on.
 
 ## Building from source
 

@@ -15,7 +15,7 @@
 
 use minigraf::{MinigrafError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -121,6 +121,29 @@ impl MiniGrafDb {
             *guard = None;
         }
     }
+
+    /// The database, cloned so that no lock of this handle is held while the
+    /// core runs: a user function may call back into the same handle.
+    fn core(&self) -> Result<minigraf::Minigraf, String> {
+        self.db
+            .lock()
+            .map(|db| db.clone())
+            .map_err(|_| "database lock poisoned".to_string())
+    }
+
+    /// Record the outcome of an `int` call: 0 on success, -1 on error.
+    fn status(&self, result: Result<(), String>) -> c_int {
+        match result {
+            Ok(()) => {
+                self.clear_error();
+                0
+            }
+            Err(e) => {
+                self.set_error(e);
+                -1
+            }
+        }
+    }
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -184,16 +207,14 @@ pub extern "C" fn minigraf_execute(handle: *mut MiniGrafDb, datalog: *const c_ch
         }
     };
 
-    let db_guard = match handle.db.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            handle.set_error("database lock poisoned".into());
+    let db = match handle.core() {
+        Ok(db) => db,
+        Err(e) => {
+            handle.set_error(e);
             return std::ptr::null_mut();
         }
     };
-    let result = db_guard.execute(datalog);
-    drop(db_guard);
-    match result {
+    match db.execute(datalog) {
         Ok(qr) => {
             handle.clear_error();
             let json = query_result_to_json(qr);
@@ -229,23 +250,10 @@ pub extern "C" fn minigraf_checkpoint(handle: *mut MiniGrafDb) -> c_int {
         return -1;
     }
     let handle = unsafe { &*handle };
-    let db_guard = match handle.db.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            handle.set_error("database lock poisoned".into());
-            return -1;
-        }
-    };
-    match db_guard.checkpoint() {
-        Ok(_) => {
-            handle.clear_error();
-            0
-        }
-        Err(e) => {
-            handle.set_error(format!("{e:#}"));
-            -1
-        }
-    }
+    let result = handle
+        .core()
+        .and_then(|db| db.checkpoint().map_err(|e| format!("{e:#}")));
+    handle.status(result.map(drop))
 }
 
 // ─── Open options ─────────────────────────────────────────────────────────────
@@ -349,17 +357,10 @@ pub extern "C" fn minigraf_current_tx_count(handle: *mut MiniGrafDb, out: *mut u
         return -1;
     }
     let handle = unsafe { &*handle };
-    match handle.db.lock() {
-        Ok(db) => {
-            handle.clear_error();
-            unsafe { *out = db.current_tx_count() };
-            0
-        }
-        Err(_) => {
-            handle.set_error("database lock poisoned".into());
-            -1
-        }
-    }
+    let result = handle
+        .core()
+        .map(|db| unsafe { *out = db.current_tx_count() });
+    handle.status(result)
 }
 
 // ─── Cursor ───────────────────────────────────────────────────────────────────
@@ -385,9 +386,10 @@ pub extern "C" fn minigraf_query(
     let handle = unsafe { &*handle };
     let result = arg_str(datalog, "datalog")
         .map_err(|e| e.to_string())
-        .and_then(|q| match handle.db.lock() {
-            Ok(db) => db.query(q).map_err(|e| e.to_string()),
-            Err(_) => Err("database lock poisoned".to_string()),
+        .and_then(|q| {
+            handle
+                .core()
+                .and_then(|db| db.query(q).map_err(|e| e.to_string()))
         });
     match result {
         Ok(cursor) => {
@@ -497,9 +499,10 @@ pub extern "C" fn minigraf_prepare(
     let handle = unsafe { &*handle };
     let result = arg_str(datalog, "datalog")
         .map_err(|e| e.to_string())
-        .and_then(|q| match handle.db.lock() {
-            Ok(db) => db.prepare(q).map_err(|e| e.to_string()),
-            Err(_) => Err("database lock poisoned".to_string()),
+        .and_then(|q| {
+            handle
+                .core()
+                .and_then(|db| db.prepare(q).map_err(|e| e.to_string()))
         })
         .and_then(|q| {
             let slot = Arc::new(Mutex::new(Some(q)));
@@ -945,9 +948,10 @@ pub extern "C" fn minigraf_fact_log(
     let result = json_arg::<FactFilterJson>(filter_json, "filter_json")
         .and_then(|f| f.to_core())
         .map_err(|e| e.to_string())
-        .and_then(|filter| match handle.db.lock() {
-            Ok(db) => db.fact_log(&filter).map_err(|e| e.to_string()),
-            Err(_) => Err("database lock poisoned".to_string()),
+        .and_then(|filter| {
+            handle
+                .core()
+                .and_then(|db| db.fact_log(&filter).map_err(|e| e.to_string()))
         });
     match result {
         Ok(log) => {
@@ -1211,6 +1215,293 @@ pub extern "C" fn minigraf_log_writer_free(writer: *mut MiniGrafLogWriter) {
     if !writer.is_null() {
         unsafe { drop(Box::from_raw(writer)) };
     }
+}
+
+// ─── User functions ───────────────────────────────────────────────────────────
+
+/// The result and error of one user-function call, set with
+/// `minigraf_udf_result` and `minigraf_udf_error`. A `ctx` is valid only
+/// during the call it was passed to.
+#[derive(Default)]
+pub struct MiniGrafUdfContext {
+    result: Option<Vec<u8>>,
+    error: Option<String>,
+}
+
+/// Frees `user_data`, or an accumulator.
+#[allow(non_camel_case_types)]
+pub type minigraf_destroy_fn = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
+
+/// A predicate: 1 true, 0 false, -1 failed (after `minigraf_udf_error`).
+/// `value_json` is a typed value, `{"type", "value"}`, as in fact records.
+#[allow(non_camel_case_types)]
+pub type minigraf_predicate_fn = Option<
+    unsafe extern "C" fn(
+        ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        value_json: *const c_char,
+    ) -> c_int,
+>;
+
+/// A new accumulator, or NULL when failed.
+#[allow(non_camel_case_types)]
+pub type minigraf_acc_new_fn = Option<
+    unsafe extern "C" fn(ctx: *mut MiniGrafUdfContext, user_data: *mut c_void) -> *mut c_void,
+>;
+
+/// Add one value to `acc`: 0 ok, -1 failed.
+#[allow(non_camel_case_types)]
+pub type minigraf_acc_step_fn = Option<
+    unsafe extern "C" fn(
+        ctx: *mut MiniGrafUdfContext,
+        acc: *mut c_void,
+        value_json: *const c_char,
+    ) -> c_int,
+>;
+
+/// The aggregate of the `count` values stepped so far: 0 ok after
+/// `minigraf_udf_result`, -1 failed.
+#[allow(non_camel_case_types)]
+pub type minigraf_acc_finish_fn = Option<
+    unsafe extern "C" fn(ctx: *mut MiniGrafUdfContext, acc: *mut c_void, count: i64) -> c_int,
+>;
+
+/// Fail the current call with `message` (copied; NULL gives `user function
+/// failed`). The call fails whatever the callback then returns.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_udf_error(ctx: *mut MiniGrafUdfContext, message: *const c_char) {
+    if ctx.is_null() {
+        return;
+    }
+    let message = if message.is_null() {
+        "user function failed".to_string()
+    } else {
+        unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    unsafe { &mut *ctx }.error = Some(message);
+}
+
+/// Set the result of the current `finish` call: a typed value,
+/// `{"type", "value"}` (copied). NULL clears it.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_udf_result(ctx: *mut MiniGrafUdfContext, value_json: *const c_char) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe { &mut *ctx }.result =
+        (!value_json.is_null()).then(|| unsafe { CStr::from_ptr(value_json) }.to_bytes().to_vec());
+}
+
+impl MiniGrafUdfContext {
+    /// The call's outcome: the error it set, else a failure when `rc` is -1 or
+    /// not one of `ok`.
+    fn check(&self, rc: c_int, ok: &[c_int]) -> Result<c_int, minigraf::UdfError> {
+        if let Some(msg) = &self.error {
+            return Err(minigraf::UdfError::new(msg.clone()));
+        }
+        if rc == -1 {
+            return Err(minigraf::UdfError::new("user function failed"));
+        }
+        if !ok.contains(&rc) {
+            return Err(minigraf::UdfError::new(format!(
+                "user function returned {rc}"
+            )));
+        }
+        Ok(rc)
+    }
+}
+
+/// `value` as the JSON a callback receives.
+fn udf_value(value: &Value) -> CString {
+    c_string(serde_json::to_string(&ValueJson::from(value.clone())).unwrap_or_default())
+}
+
+/// `user_data` and its destructor, run when the last function holding it drops.
+struct UserData {
+    ptr: *mut c_void,
+    destroy: minigraf_destroy_fn,
+}
+
+// SAFETY: the caller's contract in the registration docs: the callbacks and
+// `user_data` are safe to use from any thread that queries the database.
+unsafe impl Send for UserData {}
+unsafe impl Sync for UserData {}
+
+impl UserData {
+    /// The pointer. A method, so that a closure captures the whole `UserData`
+    /// (`Send + Sync`), not the raw pointer field.
+    fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+impl Drop for UserData {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy {
+            unsafe { destroy(self.ptr) };
+        }
+    }
+}
+
+/// A required callback, or API-017 naming it.
+fn required<T>(f: Option<T>, what: &str) -> Result<T, String> {
+    f.ok_or_else(|| MinigrafError::invalid_argument(format!("{what} is NULL")).to_string())
+}
+
+/// Register predicate `name`, called in Datalog as `[(name ?v)]`. Returns 0 on
+/// success, -1 on error (call `minigraf_last_error`): API-017 for a NULL
+/// argument, INT-040 for a name that is taken. On an error `destroy` has
+/// already run. A failing call stops the query with QRY-014.
+///
+/// `destroy(user_data)` runs, if not NULL, when the last reference to the
+/// function drops: after `minigraf_close` and after every cursor, fact log
+/// and prepared query from the database is freed. Until then `user_data` must
+/// stay valid. A query sees the functions registered when it opened.
+///
+/// Threading: `f` runs on the thread that calls `minigraf_execute`, a cursor's
+/// `minigraf_cursor_next_batch` or a prepared query, and queries on different
+/// threads may call it at once: `f` and `user_data` must be safe to use from
+/// any thread that queries the database. `destroy` runs on the thread that
+/// drops the last reference. A callback may query, write to and register
+/// functions on its own database, but must not close it.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_register_predicate(
+    db: *mut MiniGrafDb,
+    name: *const c_char,
+    f: minigraf_predicate_fn,
+    user_data: *mut c_void,
+    destroy: minigraf_destroy_fn,
+) -> c_int {
+    let user_data = UserData {
+        ptr: user_data,
+        destroy,
+    };
+    if db.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*db };
+    let result = (|| {
+        let name = arg_str(name, "name").map_err(|e| e.to_string())?;
+        let f = required(f, "f")?;
+        let core = handle.core()?;
+        core.try_register_predicate(name, move |v| {
+            let json = udf_value(v);
+            let mut ctx = MiniGrafUdfContext::default();
+            let rc = unsafe { f(&mut ctx, user_data.ptr(), json.as_ptr()) };
+            ctx.check(rc, &[0, 1]).map(|rc| rc == 1)
+        })
+        .map_err(|e| e.to_string())
+    })();
+    handle.status(result)
+}
+
+/// An aggregate's callbacks and `user_data`, shared by its accumulators.
+struct AggregateFns {
+    init: unsafe extern "C" fn(*mut MiniGrafUdfContext, *mut c_void) -> *mut c_void,
+    step: unsafe extern "C" fn(*mut MiniGrafUdfContext, *mut c_void, *const c_char) -> c_int,
+    finish: unsafe extern "C" fn(*mut MiniGrafUdfContext, *mut c_void, i64) -> c_int,
+    acc_free: minigraf_destroy_fn,
+    user_data: UserData,
+}
+
+/// One accumulator, freed with `acc_free` when the query drops it.
+struct Accumulator {
+    ptr: *mut c_void,
+    fns: Arc<AggregateFns>,
+}
+
+// SAFETY: as for `UserData`; one query uses an accumulator on one thread at a
+// time.
+unsafe impl Send for Accumulator {}
+
+impl Drop for Accumulator {
+    fn drop(&mut self) {
+        if let Some(free) = self.fns.acc_free {
+            unsafe { free(self.ptr) };
+        }
+    }
+}
+
+/// Register aggregate `name`, used as `(name ?v)` in `:find` or with `:over`.
+/// `init` makes one accumulator per group or window partition, `step` adds a
+/// value to it and `finish` sets the aggregate with `minigraf_udf_result`;
+/// `acc_free(acc)`, if not NULL, frees it when the query drops it (after
+/// `finish`, on an error, or at an early `minigraf_cursor_free`). An
+/// aggregate steps a group's non-nil values and gets `nil` with none; a window
+/// steps every value and calls `finish` once per set of peer rows.
+///
+/// Returns 0 on success, -1 on error, as `minigraf_register_predicate`, whose
+/// rules for `user_data`, `destroy`, failing calls and threading apply.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn minigraf_register_aggregate(
+    db: *mut MiniGrafDb,
+    name: *const c_char,
+    init: minigraf_acc_new_fn,
+    step: minigraf_acc_step_fn,
+    finish: minigraf_acc_finish_fn,
+    acc_free: minigraf_destroy_fn,
+    user_data: *mut c_void,
+    destroy: minigraf_destroy_fn,
+) -> c_int {
+    let user_data = UserData {
+        ptr: user_data,
+        destroy,
+    };
+    if db.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*db };
+    let result = (|| {
+        let name = arg_str(name, "name").map_err(|e| e.to_string())?;
+        let fns = Arc::new(AggregateFns {
+            init: required(init, "init")?,
+            step: required(step, "step")?,
+            finish: required(finish, "finish")?,
+            acc_free,
+            user_data,
+        });
+        let core = handle.core()?;
+        core.try_register_aggregate(
+            name,
+            move || {
+                let mut ctx = MiniGrafUdfContext::default();
+                let ptr = unsafe { (fns.init)(&mut ctx, fns.user_data.ptr()) };
+                // Wrapped first, so that a failing init's accumulator is freed.
+                let acc = (!ptr.is_null()).then(|| Accumulator {
+                    ptr,
+                    fns: Arc::clone(&fns),
+                });
+                ctx.check(if ptr.is_null() { -1 } else { 0 }, &[0])?;
+                acc.ok_or_else(|| minigraf::UdfError::new("user function failed"))
+            },
+            |acc: &mut Accumulator, v| {
+                let json = udf_value(v);
+                let mut ctx = MiniGrafUdfContext::default();
+                let rc = unsafe { (acc.fns.step)(&mut ctx, acc.ptr, json.as_ptr()) };
+                ctx.check(rc, &[0]).map(drop)
+            },
+            |acc: &Accumulator, count| {
+                let mut ctx = MiniGrafUdfContext::default();
+                let count = i64::try_from(count).unwrap_or(i64::MAX);
+                let rc = unsafe { (acc.fns.finish)(&mut ctx, acc.ptr, count) };
+                ctx.check(rc, &[0])?;
+                let json = ctx
+                    .result
+                    .ok_or_else(|| minigraf::UdfError::new("finish set no result"))?;
+                serde_json::from_slice::<ValueJson>(&json)
+                    .map_err(|e| {
+                        minigraf::UdfError::new(format!("finish result is not a value: {e}"))
+                    })?
+                    .to_core()
+                    .map_err(|e| minigraf::UdfError::new(e.to_string()))
+            },
+        )
+        .map_err(|e| e.to_string())
+    })();
+    handle.status(result)
 }
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -1923,5 +2214,511 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nested.to_core().err().unwrap().code(), "API-021");
+    }
+
+    // ─── User functions (minigraf#180) ───────────────────────────────────
+
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::SeqCst};
+
+    /// What the test callbacks saw, passed as `user_data`. Leaked, so that it
+    /// outlives every database.
+    #[derive(Default)]
+    struct Counts {
+        calls: AtomicUsize,
+        destroyed: AtomicUsize,
+        accs: AtomicUsize,
+        freed: AtomicUsize,
+        /// The database a re-entrant callback calls back into.
+        db: AtomicPtr<MiniGrafDb>,
+    }
+
+    fn counts() -> &'static Counts {
+        Box::leak(Box::default())
+    }
+
+    fn ud(counts: &'static Counts) -> *mut c_void {
+        std::ptr::from_ref(counts).cast_mut().cast()
+    }
+
+    fn counts_of(user_data: *mut c_void) -> &'static Counts {
+        unsafe { &*user_data.cast::<Counts>() }
+    }
+
+    fn value_of(value_json: *const c_char) -> serde_json::Value {
+        serde_json::from_str(unsafe { CStr::from_ptr(value_json) }.to_str().unwrap()).unwrap()
+    }
+
+    unsafe extern "C" fn destroy(user_data: *mut c_void) {
+        counts_of(user_data).destroyed.fetch_add(1, SeqCst);
+    }
+
+    /// `even?`: 1 for an even integer, 0 for an odd one, -1 with a message for
+    /// anything else.
+    unsafe extern "C" fn is_even(
+        ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        value_json: *const c_char,
+    ) -> c_int {
+        counts_of(user_data).calls.fetch_add(1, SeqCst);
+        let v = value_of(value_json);
+        match v["value"].as_i64() {
+            Some(n) if v["type"] == "integer" => c_int::from(n % 2 == 0),
+            _ => {
+                minigraf_udf_error(ctx, c("not an integer").as_ptr());
+                -1
+            }
+        }
+    }
+
+    unsafe extern "C" fn fails_silently(
+        _ctx: *mut MiniGrafUdfContext,
+        _user_data: *mut c_void,
+        _value_json: *const c_char,
+    ) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn errors_but_returns_true(
+        ctx: *mut MiniGrafUdfContext,
+        _user_data: *mut c_void,
+        _value_json: *const c_char,
+    ) -> c_int {
+        minigraf_udf_error(ctx, c("set an error").as_ptr());
+        1
+    }
+
+    unsafe extern "C" fn returns_two(
+        _ctx: *mut MiniGrafUdfContext,
+        _user_data: *mut c_void,
+        _value_json: *const c_char,
+    ) -> c_int {
+        2
+    }
+
+    /// True when `:a` has `:n 1`, read through the database in `user_data`
+    /// with both a cursor and `minigraf_execute`.
+    unsafe extern "C" fn queries_own_db(
+        ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        _value_json: *const c_char,
+    ) -> c_int {
+        let db = counts_of(user_data).db.load(SeqCst);
+        let q = c("(query [:find ?e :where [?e :n 1]])");
+        let cursor = minigraf_query(db, q.as_ptr());
+        if cursor.is_null() {
+            minigraf_udf_error(ctx, c("minigraf_query failed").as_ptr());
+            return -1;
+        }
+        let batch = take(minigraf_cursor_next_batch(cursor, 10));
+        minigraf_cursor_free(cursor);
+        let executed = take(minigraf_execute(db, q.as_ptr()));
+        let other = c("(transact [[:x :seen true]])");
+        let wrote = take(minigraf_execute(db, other.as_ptr())).is_some();
+        let n = c("inner?");
+        // Taken after the first call.
+        let registered =
+            minigraf_register_predicate(db, n.as_ptr(), Some(is_even), user_data, None) == 0
+                || text(minigraf_last_error(db)).contains("INT-040");
+        let found = batch.is_some_and(|b| b.len() > 2) && executed.is_some_and(|e| e.contains('['));
+        c_int::from(found && wrote && registered)
+    }
+
+    /// `total`: the sum and the count, as `"sum/count"`.
+    struct Total {
+        sum: i64,
+        counts: &'static Counts,
+    }
+
+    unsafe extern "C" fn total_new(
+        _ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+    ) -> *mut c_void {
+        let counts = counts_of(user_data);
+        counts.accs.fetch_add(1, SeqCst);
+        Box::into_raw(Box::new(Total { sum: 0, counts })).cast()
+    }
+
+    unsafe extern "C" fn new_fails(
+        ctx: *mut MiniGrafUdfContext,
+        _user_data: *mut c_void,
+    ) -> *mut c_void {
+        minigraf_udf_error(ctx, c("no accumulator").as_ptr());
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn total_step(
+        _ctx: *mut MiniGrafUdfContext,
+        acc: *mut c_void,
+        value_json: *const c_char,
+    ) -> c_int {
+        let total = unsafe { &mut *acc.cast::<Total>() };
+        total.sum += value_of(value_json)["value"].as_i64().unwrap();
+        0
+    }
+
+    unsafe extern "C" fn step_fails(
+        ctx: *mut MiniGrafUdfContext,
+        _acc: *mut c_void,
+        _value_json: *const c_char,
+    ) -> c_int {
+        minigraf_udf_error(ctx, c("bad step").as_ptr());
+        -1
+    }
+
+    fn set_result(ctx: *mut MiniGrafUdfContext, json: &str) -> c_int {
+        minigraf_udf_result(ctx, c(json).as_ptr());
+        0
+    }
+
+    unsafe extern "C" fn total_finish(
+        ctx: *mut MiniGrafUdfContext,
+        acc: *mut c_void,
+        count: i64,
+    ) -> c_int {
+        let total = unsafe { &*acc.cast::<Total>() };
+        let sum = total.sum;
+        set_result(
+            ctx,
+            &serde_json::json!({"type": "string", "value": format!("{sum}/{count}")}).to_string(),
+        )
+    }
+
+    unsafe extern "C" fn finish_no_result(
+        _ctx: *mut MiniGrafUdfContext,
+        _acc: *mut c_void,
+        _count: i64,
+    ) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn finish_bad_json(
+        ctx: *mut MiniGrafUdfContext,
+        _acc: *mut c_void,
+        _count: i64,
+    ) -> c_int {
+        set_result(ctx, "{nope")
+    }
+
+    unsafe extern "C" fn finish_bad_ref(
+        ctx: *mut MiniGrafUdfContext,
+        _acc: *mut c_void,
+        _count: i64,
+    ) -> c_int {
+        set_result(ctx, r#"{"type": "ref", "value": "nope"}"#)
+    }
+
+    unsafe extern "C" fn finish_fails_silently(
+        _ctx: *mut MiniGrafUdfContext,
+        _acc: *mut c_void,
+        _count: i64,
+    ) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn total_free(acc: *mut c_void) {
+        let total = unsafe { Box::from_raw(acc.cast::<Total>()) };
+        total.counts.freed.fetch_add(1, SeqCst);
+    }
+
+    fn register_even(
+        db: *mut MiniGrafDb,
+        name: &str,
+        f: minigraf_predicate_fn,
+        counts: &'static Counts,
+    ) -> c_int {
+        minigraf_register_predicate(db, c(name).as_ptr(), f, ud(counts), Some(destroy))
+    }
+
+    fn register_total(
+        db: *mut MiniGrafDb,
+        name: &str,
+        init: minigraf_acc_new_fn,
+        step: minigraf_acc_step_fn,
+        finish: minigraf_acc_finish_fn,
+        counts: &'static Counts,
+    ) -> c_int {
+        minigraf_register_aggregate(
+            db,
+            c(name).as_ptr(),
+            init,
+            step,
+            finish,
+            Some(total_free),
+            ud(counts),
+            Some(destroy),
+        )
+    }
+
+    fn udf_db() -> *mut MiniGrafDb {
+        let db = minigraf_open_in_memory();
+        exec(
+            db,
+            "(transact [[:a :n 1] [:b :n 2] [:c :n 3] [:d :n 4] [:a :g 1] [:b :g 1] [:c :g 2] [:d :g 2]])",
+        );
+        db
+    }
+
+    fn sorted_rows(db: *mut MiniGrafDb, q: &str) -> Vec<serde_json::Value> {
+        let out = take(minigraf_execute(db, c(q).as_ptr()))
+            .unwrap_or_else(|| panic!("query failed: {}", text(minigraf_last_error(db))));
+        let mut rows = results(&out);
+        rows.sort_by_key(|r| r[0].as_i64());
+        rows
+    }
+
+    fn query_err(db: *mut MiniGrafDb, q: &str) -> String {
+        assert!(
+            minigraf_execute(db, c(q).as_ptr()).is_null(),
+            "query should fail"
+        );
+        text(minigraf_last_error(db))
+    }
+
+    #[test]
+    fn predicate_filters_rows() {
+        let db = udf_db();
+        let counts = counts();
+        assert_eq!(register_even(db, "even?", Some(is_even), counts), 0);
+        let rows = sorted_rows(db, "(query [:find ?n :where [?e :n ?n] [(even? ?n)]])");
+        assert_eq!(rows, vec![serde_json::json!([2]), serde_json::json!([4])]);
+        assert_eq!(counts.calls.load(SeqCst), 4);
+        assert_eq!(counts.destroyed.load(SeqCst), 0);
+        minigraf_close(db);
+        assert_eq!(counts.destroyed.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn failing_predicate_is_qry_014() {
+        let db = udf_db();
+        exec(db, r#"(transact [[:e :n "x"]])"#);
+        assert_eq!(register_even(db, "even?", Some(is_even), counts()), 0);
+        let msg = query_err(db, "(query [:find ?n :where [?e :n ?n] [(even? ?n)]])");
+        assert!(msg.contains("QRY-014") && msg.contains("even?") && msg.contains("not an integer"));
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn predicate_return_codes() {
+        let db = udf_db();
+        for (name, f) in [
+            (
+                "silent?",
+                fails_silently as unsafe extern "C" fn(_, _, _) -> _,
+            ),
+            ("both?", errors_but_returns_true),
+            ("two?", returns_two),
+        ] {
+            assert_eq!(register_even(db, name, Some(f), counts()), 0);
+        }
+        let q = |name: &str| format!("(query [:find ?n :where [?e :n ?n] [({name} ?n)]])");
+        let msg = query_err(db, &q("silent?"));
+        assert!(msg.contains("QRY-014") && msg.contains("user function failed"));
+        // An error set with minigraf_udf_error fails the call, whatever it returns.
+        let msg = query_err(db, &q("both?"));
+        assert!(msg.contains("QRY-014") && msg.contains("set an error"));
+        let msg = query_err(db, &q("two?"));
+        assert!(msg.contains("QRY-014") && msg.contains("returned 2"));
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn aggregate_in_find_and_over() {
+        let db = udf_db();
+        let counts = counts();
+        let rc = register_total(
+            db,
+            "total",
+            Some(total_new),
+            Some(total_step),
+            Some(total_finish),
+            counts,
+        );
+        assert_eq!(rc, 0);
+        let rows = sorted_rows(db, "(query [:find (total ?n) :where [?e :n ?n]])");
+        assert_eq!(rows, vec![serde_json::json!(["10/4"])]);
+        let rows = sorted_rows(
+            db,
+            "(query [:find ?n (total ?n :over (:partition-by ?g :order-by ?n)) :where [?e :n ?n] [?e :g ?g]])",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!([1, "1/1"]),
+                serde_json::json!([2, "3/2"]),
+                serde_json::json!([3, "3/1"]),
+                serde_json::json!([4, "7/2"]),
+            ]
+        );
+        assert!(counts.accs.load(SeqCst) >= 3);
+        assert_eq!(counts.freed.load(SeqCst), counts.accs.load(SeqCst));
+        minigraf_close(db);
+        assert_eq!(counts.destroyed.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn aggregate_failures_are_qry_014() {
+        let db = udf_db();
+        let counts = counts();
+        let cases: [(
+            &str,
+            minigraf_acc_new_fn,
+            minigraf_acc_step_fn,
+            minigraf_acc_finish_fn,
+            &str,
+        ); 6] = [
+            (
+                "a",
+                Some(new_fails),
+                Some(total_step),
+                Some(total_finish),
+                "no accumulator",
+            ),
+            (
+                "b",
+                Some(total_new),
+                Some(step_fails),
+                Some(total_finish),
+                "bad step",
+            ),
+            (
+                "c",
+                Some(total_new),
+                Some(total_step),
+                Some(finish_no_result),
+                "no result",
+            ),
+            (
+                "d",
+                Some(total_new),
+                Some(total_step),
+                Some(finish_bad_json),
+                "not a value",
+            ),
+            (
+                "e",
+                Some(total_new),
+                Some(total_step),
+                Some(finish_bad_ref),
+                r#"ref value "nope" is not a UUID"#,
+            ),
+            (
+                "f",
+                Some(total_new),
+                Some(total_step),
+                Some(finish_fails_silently),
+                "user function failed",
+            ),
+        ];
+        for (name, init, step, finish, want) in cases {
+            assert_eq!(register_total(db, name, init, step, finish, counts), 0);
+            let msg = query_err(
+                db,
+                &format!("(query [:find ({name} ?n) :where [?e :n ?n]])"),
+            );
+            assert!(
+                msg.contains("QRY-014") && msg.contains(want),
+                "aggregate {name}: {msg}"
+            );
+        }
+        assert_eq!(counts.freed.load(SeqCst), counts.accs.load(SeqCst));
+        minigraf_close(db);
+        assert_eq!(counts.destroyed.load(SeqCst), 6);
+    }
+
+    #[test]
+    fn destroy_waits_for_every_cursor() {
+        let db = udf_db();
+        let counts = counts();
+        assert_eq!(register_even(db, "even?", Some(is_even), counts), 0);
+        let rc = register_total(
+            db,
+            "total",
+            Some(total_new),
+            Some(total_step),
+            Some(total_finish),
+            counts,
+        );
+        assert_eq!(rc, 0);
+        let q = c("(query [:find ?n :where [?e :n ?n] [(even? ?n)]])");
+        let filtered = minigraf_query(db, q.as_ptr());
+        let q = c("(query [:find ?g (total ?n) :where [?e :n ?n] [?e :g ?g]])");
+        let grouped = minigraf_query(db, q.as_ptr());
+        assert!(!filtered.is_null() && !grouped.is_null());
+        minigraf_close(db);
+        assert_eq!(
+            counts.destroyed.load(SeqCst),
+            0,
+            "a cursor still holds both functions"
+        );
+        assert!(take(minigraf_cursor_next_batch(filtered, 1)).is_some());
+        // Freed before its first batch: every accumulator it made is freed.
+        minigraf_cursor_free(grouped);
+        assert_eq!(counts.freed.load(SeqCst), counts.accs.load(SeqCst));
+        assert_eq!(
+            counts.destroyed.load(SeqCst),
+            0,
+            "the other cursor still holds them"
+        );
+        minigraf_cursor_free(filtered);
+        assert_eq!(counts.destroyed.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_registration_runs_destroy() {
+        let db = udf_db();
+        let counts = counts();
+        assert_eq!(register_even(db, "even?", Some(is_even), counts), 0);
+        assert_eq!(register_even(db, "even?", Some(is_even), counts), -1);
+        assert!(text(minigraf_last_error(db)).contains("INT-040"));
+        assert_eq!(counts.destroyed.load(SeqCst), 1);
+        assert_eq!(register_even(db, "none?", None, counts), -1);
+        assert!(text(minigraf_last_error(db)).contains("API-017"));
+        assert_eq!(
+            register_total(db, "t", Some(total_new), None, Some(total_finish), counts),
+            -1
+        );
+        assert!(text(minigraf_last_error(db)).contains("API-017"));
+        let rc = minigraf_register_predicate(
+            db,
+            std::ptr::null(),
+            Some(is_even),
+            ud(counts),
+            Some(destroy),
+        );
+        assert_eq!(rc, -1);
+        assert!(text(minigraf_last_error(db)).contains("API-017"));
+        assert_eq!(
+            register_even(std::ptr::null_mut(), "x?", Some(is_even), counts),
+            -1
+        );
+        assert_eq!(counts.destroyed.load(SeqCst), 5);
+        minigraf_close(db);
+        assert_eq!(counts.destroyed.load(SeqCst), 6);
+    }
+
+    #[test]
+    fn callback_calls_back_into_its_database() {
+        let db = udf_db();
+        let counts = counts();
+        counts.db.store(db, SeqCst);
+        assert_eq!(register_even(db, "own?", Some(queries_own_db), counts), 0);
+        let rows = sorted_rows(db, "(query [:find ?n :where [?e :n ?n] [(own? ?n)]])");
+        assert_eq!(rows.len(), 4, "every call saw its own database");
+        let seen = sorted_rows(db, "(query [:find ?e :where [?e :seen true]])");
+        assert_eq!(seen.len(), 1, "the callbacks' writes landed");
+        let rows = sorted_rows(db, "(query [:find ?n :where [?e :n ?n] [(inner? ?n)]])");
+        assert_eq!(rows.len(), 2, "a function registered from a callback works");
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn udf_context_null_arguments_are_safe() {
+        minigraf_udf_error(std::ptr::null_mut(), c("x").as_ptr());
+        minigraf_udf_result(std::ptr::null_mut(), c("1").as_ptr());
+        let mut ctx = MiniGrafUdfContext::default();
+        minigraf_udf_error(&mut ctx, std::ptr::null());
+        minigraf_udf_result(&mut ctx, std::ptr::null());
+        assert!(ctx.result.is_none());
+        assert_eq!(ctx.error.as_deref(), Some("user function failed"));
     }
 }

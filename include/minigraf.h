@@ -19,6 +19,32 @@ typedef struct MiniGrafLogWriter MiniGrafLogWriter;
 
 typedef struct MiniGrafPrepared MiniGrafPrepared;
 
+// The result and error of one user-function call, set with
+// `minigraf_udf_result` and `minigraf_udf_error`. A `ctx` is valid only
+// during the call it was passed to.
+typedef struct MiniGrafUdfContext MiniGrafUdfContext;
+
+// A predicate: 1 true, 0 false, -1 failed (after `minigraf_udf_error`).
+// `value_json` is a typed value, `{"type", "value"}`, as in fact records.
+typedef int (*minigraf_predicate_fn)(struct MiniGrafUdfContext *ctx,
+                                     void *user_data,
+                                     const char *value_json);
+
+// Frees `user_data`, or an accumulator.
+typedef void (*minigraf_destroy_fn)(void *user_data);
+
+// A new accumulator, or NULL when failed.
+typedef void *(*minigraf_acc_new_fn)(struct MiniGrafUdfContext *ctx, void *user_data);
+
+// Add one value to `acc`: 0 ok, -1 failed.
+typedef int (*minigraf_acc_step_fn)(struct MiniGrafUdfContext *ctx,
+                                    void *acc,
+                                    const char *value_json);
+
+// The aggregate of the `count` values stepped so far: 0 ok after
+// `minigraf_udf_result`, -1 failed.
+typedef int (*minigraf_acc_finish_fn)(struct MiniGrafUdfContext *ctx, void *acc, int64_t count);
+
 // Open a file-backed Minigraf database. Returns NULL on error.
 struct MiniGrafDb *minigraf_open(const char *path);
 
@@ -171,6 +197,55 @@ const char *minigraf_log_writer_last_error(struct MiniGrafLogWriter *writer);
 
 // Free a writer. An unfinished build is abandoned and leaves no file.
 void minigraf_log_writer_free(struct MiniGrafLogWriter *writer);
+
+// Fail the current call with `message` (copied; NULL gives `user function
+// failed`). The call fails whatever the callback then returns.
+void minigraf_udf_error(struct MiniGrafUdfContext *ctx, const char *message);
+
+// Set the result of the current `finish` call: a typed value,
+// `{"type", "value"}` (copied). NULL clears it.
+void minigraf_udf_result(struct MiniGrafUdfContext *ctx, const char *value_json);
+
+// Register predicate `name`, called in Datalog as `[(name ?v)]`. Returns 0 on
+// success, -1 on error (call `minigraf_last_error`): API-017 for a NULL
+// argument, INT-040 for a name that is taken. On an error `destroy` has
+// already run. A failing call stops the query with QRY-014.
+//
+// `destroy(user_data)` runs, if not NULL, when the last reference to the
+// function drops: after `minigraf_close` and after every cursor, fact log
+// and prepared query from the database is freed. Until then `user_data` must
+// stay valid. A query sees the functions registered when it opened.
+//
+// Threading: `f` runs on the thread that calls `minigraf_execute`, a cursor's
+// `minigraf_cursor_next_batch` or a prepared query, and queries on different
+// threads may call it at once: `f` and `user_data` must be safe to use from
+// any thread that queries the database. `destroy` runs on the thread that
+// drops the last reference. A callback may query, write to and register
+// functions on its own database, but must not close it.
+int minigraf_register_predicate(struct MiniGrafDb *db,
+                                const char *name,
+                                minigraf_predicate_fn f,
+                                void *user_data,
+                                minigraf_destroy_fn destroy);
+
+// Register aggregate `name`, used as `(name ?v)` in `:find` or with `:over`.
+// `init` makes one accumulator per group or window partition, `step` adds a
+// value to it and `finish` sets the aggregate with `minigraf_udf_result`;
+// `acc_free(acc)`, if not NULL, frees it when the query drops it (after
+// `finish`, on an error, or at an early `minigraf_cursor_free`). An
+// aggregate steps a group's non-nil values and gets `nil` with none; a window
+// steps every value and calls `finish` once per set of peer rows.
+//
+// Returns 0 on success, -1 on error, as `minigraf_register_predicate`, whose
+// rules for `user_data`, `destroy`, failing calls and threading apply.
+int minigraf_register_aggregate(struct MiniGrafDb *db,
+                                const char *name,
+                                minigraf_acc_new_fn init,
+                                minigraf_acc_step_fn step,
+                                minigraf_acc_finish_fn finish,
+                                minigraf_destroy_fn acc_free,
+                                void *user_data,
+                                minigraf_destroy_fn destroy);
 
 // Return the last error message. Valid until the next call on the same handle.
 // Returns NULL if no error has occurred.
