@@ -64,6 +64,42 @@ static Answer decode(const char *json) {
     }
     return a;
 }
+typedef struct { char text[16]; long long number; } SetAnswer;
+static const char *skip_space(const char *p) {
+    while (isspace((unsigned char)*p)) p++;
+    return p;
+}
+/* Decode this fixture's returned [string, integer] set. Expected values are
+ * compared after the ending clock read; no constant Answer stands in for it. */
+static SetAnswer decode_set(const char *json) {
+    const char *p = strstr(json, "\"results\":");
+    REQUIRE(p != NULL);
+    p = skip_space(p + 10);
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(*p == '[');
+        p = skip_space(p + 1);
+    }
+    REQUIRE(*p++ == '"');
+    SetAnswer set = {{0}, 0};
+    size_t length = 0;
+    while (*p && *p != '"') {
+        REQUIRE(length + 1 < sizeof set.text);
+        set.text[length++] = *p++;
+    }
+    REQUIRE(*p == '"');
+    p = skip_space(p + 1);
+    REQUIRE(*p == ',');
+    p = skip_space(p + 1);
+    char *end;
+    set.number = strtoll(p, &end, 10);
+    REQUIRE(end > p);
+    p = skip_space(end);
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(*p == ']');
+        p = skip_space(p + 1);
+    }
+    return set;
+}
 static MiniGrafPrepared *prepare(MiniGrafDb *db, const char *q) {
     MiniGrafPrepared *p = minigraf_prepare(db, q);
     REQUIRE(p != NULL);
@@ -111,6 +147,7 @@ int main(int argc, char **argv) {
         for (int s = 0; s < (test ? 1 : 10); s++) {
             double start = test ? 0 : now_ns();
             Answer a = {0, 0};
+            SetAnswer set = {{0}, 0};
             if (c == 1 || c == 2) {
                 MiniGrafCursor *cursor = minigraf_prepared_query(queries[1], "{\"min\":0}");
                 REQUIRE(cursor != NULL);
@@ -126,13 +163,13 @@ int main(int argc, char **argv) {
                 r = minigraf_prepared_execute(queries[q], c == 0 ? "{\"n\":500}" : c == 3 ? "{\"s\":{\"type\":\"set\",\"value\":[1,\"x\"]}}" : "{}");
                 REQUIRE(r != NULL);
                 if (c == 3) {
-                    REQUIRE(strstr(r, "[[[\"x\",1]]]") != NULL);
-                    a = (Answer){1, 1};
+                    set = decode_set(r);
                 } else a = decode(r);
                 minigraf_string_free(r);
             }
             if (!test) samples[s] = now_ns() - start;
-            REQUIRE(a.count == counts[c] && a.sum == sums[c]);
+            if (c == 3) REQUIRE(strcmp(set.text, "x") == 0 && set.number == 1);
+            else REQUIRE(a.count == counts[c] && a.sum == sums[c]);
         }
         printf("ok: binding/c/%s\n", ids[c]);
         if (output) {
