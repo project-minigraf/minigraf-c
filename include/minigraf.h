@@ -64,12 +64,23 @@ void minigraf_string_free(char *s);
 // Flush the WAL to the database file. Returns 0 on success, -1 on error.
 int minigraf_checkpoint(struct MiniGrafDb *handle);
 
+// The override list that applies when `"allow_overrides"` is absent, the
+// Rust `Overridable::DEFAULTS`, as a JSON array of names such as
+// `["max_derived_facts","max_results","max_iterations"]`. Free it with
+// `minigraf_string_free`. Returns NULL only if out of memory.
+char *minigraf_overridable_defaults(void);
+
 // Open a file-backed database with `options_json`, a JSON object with any of
 // `read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`,
 // `max_derived_facts`, `max_results` (a deprecated alias of
-// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`) and
+// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`),
 // `query_memory_limit` (the most bytes one query may hold, else `QRY-012`;
-// default no limit); NULL means all defaults. Returns NULL on error and, if
+// default no limit), `allow_overrides` (an array of `"max_derived_facts"`,
+// `"max_results"`, `"query_memory_limit"` and `"max_iterations"`: the query
+// keywords query text may use; absent, `minigraf_overridable_defaults()`;
+// `[]` refuses them all with `API-025`), `transaction_chunk_facts` and
+// `max_iterations` (rounds per stratum of a rule query, else `INT-020`);
+// NULL means all defaults. An unknown key or name is `API-017`. Returns NULL on error and, if
 // `error_out` is not NULL, stores the message there (free it with
 // `minigraf_string_free`).
 struct MiniGrafDb *minigraf_open_with_options(const char *path,
@@ -134,6 +145,30 @@ struct MiniGrafCursor *minigraf_prepared_query(struct MiniGrafPrepared *prepared
 // The error of the last call on `prepared`, or NULL if it had none. Valid
 // until the next call on it.
 const char *minigraf_prepared_last_error(struct MiniGrafPrepared *prepared);
+
+// A new prepared query that may derive at most `n` facts; `prepared` is
+// unchanged. An allowed `:max-derived-facts` or `:max-results` in the query
+// still overrides it. `SIZE_MAX` means no limit. Not gated by
+// `allow_overrides`. Returns NULL on error (call
+// `minigraf_prepared_last_error` on `prepared`): API-018 after
+// `minigraf_close` of its database. The new query is freed with
+// `minigraf_prepared_free`, independently of `prepared`, and closed with its
+// database as `prepared` is.
+struct MiniGrafPrepared *minigraf_prepared_with_max_derived_facts(struct MiniGrafPrepared *prepared,
+                                                                  size_t n);
+
+// A new prepared query that may hold at most `bytes` bytes (QRY-012
+// beyond); `prepared` is unchanged. `0` lets only queries that hold no state
+// run. Otherwise as `minigraf_prepared_with_max_derived_facts`.
+struct MiniGrafPrepared *minigraf_prepared_with_query_memory_limit(struct MiniGrafPrepared *prepared,
+                                                                   size_t bytes);
+
+// A new prepared query whose rule strata may run at most `n` rounds
+// (INT-020 beyond); `prepared` is unchanged. An allowed `:max-iterations` in
+// the query still overrides it. Otherwise as
+// `minigraf_prepared_with_max_derived_facts`.
+struct MiniGrafPrepared *minigraf_prepared_with_max_iterations(struct MiniGrafPrepared *prepared,
+                                                               size_t n);
 
 // Free a prepared query. Call it also after `minigraf_close` of its database.
 void minigraf_prepared_free(struct MiniGrafPrepared *prepared);
