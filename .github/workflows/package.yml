@@ -36,7 +36,7 @@ jobs:
             platform: linux-aarch64
             target: aarch64-unknown-linux-gnu
             zig-target: aarch64-unknown-linux-gnu.2.17
-          - os: macos-14
+          - os: macos-15
             platform: macos-universal2
             target: universal2
           - os: windows-latest
