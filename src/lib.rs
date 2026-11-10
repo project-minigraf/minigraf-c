@@ -89,22 +89,52 @@ pub struct MiniGrafDb {
     db: Mutex<minigraf::Minigraf>,
     last_error: Mutex<Option<CString>>,
     /// Every prepared query made from this handle, emptied when it is closed
-    /// so that none keeps the file open.
-    prepared: Mutex<Vec<Weak<PreparedSlot>>>,
+    /// so that none keeps the file open. Shared with the prepared queries,
+    /// which list the queries their setters derive in it.
+    prepared: Arc<Registry>,
+}
+
+/// The prepared queries of one handle, by weak reference; `None` once the
+/// handle is closed, so that no query is listed after it.
+/// cbindgen:ignore
+type Registry = Mutex<Option<Vec<Weak<PreparedSlot>>>>;
+
+fn new_registry() -> Arc<Registry> {
+    Arc::new(Mutex::new(Some(Vec::new())))
 }
 
 impl Drop for MiniGrafDb {
     fn drop(&mut self) {
         // A prepared query holds the file open too (core's PreparedQuery keeps
         // the storage), so release every one before the database itself.
-        if let Ok(prepared) = self.prepared.get_mut() {
-            for slot in prepared.drain(..).filter_map(|w| w.upgrade()) {
-                if let Ok(mut q) = slot.lock() {
-                    *q = None;
-                }
+        let listed = match self.prepared.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        for slot in listed.into_iter().flatten().filter_map(|w| w.upgrade()) {
+            if let Ok(mut q) = slot.lock() {
+                *q = None;
             }
         }
     }
+}
+
+/// List `query` in `registry` and return its slot; `API-018` if the handle
+/// is closed.
+fn register(
+    registry: &Registry,
+    query: minigraf::PreparedQuery,
+) -> Result<Arc<PreparedSlot>, MinigrafError> {
+    let mut guard = registry
+        .lock()
+        .map_err(|_| MinigrafError::invalid_argument("database lock poisoned"))?;
+    let listed = guard
+        .as_mut()
+        .ok_or_else(|| MinigrafError::closed("database"))?;
+    let slot = Arc::new(Mutex::new(Some(query)));
+    listed.retain(|w| w.strong_count() > 0);
+    listed.push(Arc::downgrade(&slot));
+    Ok(slot)
 }
 
 impl MiniGrafDb {
@@ -162,7 +192,7 @@ pub extern "C" fn minigraf_open(path: *const c_char) -> *mut MiniGrafDb {
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
-            prepared: Mutex::default(),
+            prepared: new_registry(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -175,7 +205,7 @@ pub extern "C" fn minigraf_open_in_memory() -> *mut MiniGrafDb {
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
-            prepared: Mutex::default(),
+            prepared: new_registry(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -270,6 +300,62 @@ struct OpenOptionsJson {
     max_results: Option<usize>,
     synchronous: Option<SyncModeJson>,
     query_memory_limit: Option<usize>,
+    allow_overrides: Option<Vec<OverridableJson>>,
+    transaction_chunk_facts: Option<usize>,
+    max_iterations: Option<usize>,
+}
+
+/// A name in `"allow_overrides"`.
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OverridableJson {
+    MaxDerivedFacts,
+    MaxResults,
+    QueryMemoryLimit,
+    MaxIterations,
+}
+
+/// Each `OverridableJson` with the core variant it stands for.
+const OVERRIDABLE: [(OverridableJson, minigraf::Overridable); 4] = [
+    (
+        OverridableJson::MaxDerivedFacts,
+        minigraf::Overridable::MaxDerivedFacts,
+    ),
+    (
+        OverridableJson::MaxResults,
+        minigraf::Overridable::MaxResults,
+    ),
+    (
+        OverridableJson::QueryMemoryLimit,
+        minigraf::Overridable::QueryMemoryLimit,
+    ),
+    (
+        OverridableJson::MaxIterations,
+        minigraf::Overridable::MaxIterations,
+    ),
+];
+
+impl OverridableJson {
+    fn to_core(self) -> minigraf::Overridable {
+        OVERRIDABLE
+            .iter()
+            .find(|(j, _)| *j == self)
+            .map(|(_, o)| *o)
+            .unwrap_or(minigraf::Overridable::MaxDerivedFacts)
+    }
+}
+
+/// The override list that applies when `"allow_overrides"` is absent, the
+/// Rust `Overridable::DEFAULTS`, as a JSON array of names such as
+/// `["max_derived_facts","max_results","max_iterations"]`. Free it with
+/// `minigraf_string_free`. Returns NULL only if out of memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_overridable_defaults() -> *mut c_char {
+    let names: Vec<OverridableJson> = minigraf::Overridable::DEFAULTS
+        .iter()
+        .filter_map(|d| OVERRIDABLE.iter().find(|(_, o)| o == d).map(|(j, _)| *j))
+        .collect();
+    to_c_json(&names)
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -306,6 +392,15 @@ impl OpenOptionsJson {
         if let Some(v) = self.query_memory_limit {
             o = o.query_memory_limit(v);
         }
+        if let Some(list) = &self.allow_overrides {
+            o = o.allow_overrides(list.iter().map(|v| v.to_core()));
+        }
+        if let Some(v) = self.transaction_chunk_facts {
+            o = o.transaction_chunk_facts(v);
+        }
+        if let Some(v) = self.max_iterations {
+            o = o.max_iterations(v);
+        }
         if let Some(v) = self.synchronous {
             o = o.synchronous(match v {
                 SyncModeJson::Full => minigraf::SyncMode::Full,
@@ -323,9 +418,15 @@ fn open_options(options_json: *const c_char) -> Result<minigraf::OpenOptions, Mi
 /// Open a file-backed database with `options_json`, a JSON object with any of
 /// `read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`,
 /// `max_derived_facts`, `max_results` (a deprecated alias of
-/// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`) and
+/// `max_derived_facts`), `synchronous` (`"full"` or `"normal"`),
 /// `query_memory_limit` (the most bytes one query may hold, else `QRY-012`;
-/// default no limit); NULL means all defaults. Returns NULL on error and, if
+/// default no limit), `allow_overrides` (an array of `"max_derived_facts"`,
+/// `"max_results"`, `"query_memory_limit"` and `"max_iterations"`: the query
+/// keywords query text may use; absent, `minigraf_overridable_defaults()`;
+/// `[]` refuses them all with `API-025`), `transaction_chunk_facts` and
+/// `max_iterations` (rounds per stratum of a rule query, else `INT-020`);
+/// NULL means all defaults. An unknown key or name is `API-017`. Returns
+/// NULL on error and, if
 /// `error_out` is not NULL, stores the message there (free it with
 /// `minigraf_string_free`).
 #[unsafe(no_mangle)]
@@ -340,7 +441,7 @@ pub extern "C" fn minigraf_open_with_options(
         Ok(db) => Box::into_raw(Box::new(MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
-            prepared: Mutex::default(),
+            prepared: new_registry(),
         })),
         Err(e) => {
             report(error_out, e.to_string());
@@ -480,6 +581,8 @@ type PreparedSlot = Mutex<Option<minigraf::PreparedQuery>>;
 
 pub struct MiniGrafPrepared {
     slot: Arc<PreparedSlot>,
+    /// Its database's registry, where the setters list the queries they derive.
+    registry: Arc<Registry>,
     last_error: LastError,
 }
 
@@ -504,21 +607,13 @@ pub extern "C" fn minigraf_prepare(
                 .core()
                 .and_then(|db| db.prepare(q).map_err(|e| e.to_string()))
         })
-        .and_then(|q| {
-            let slot = Arc::new(Mutex::new(Some(q)));
-            let mut prepared = handle
-                .prepared
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
-            prepared.retain(|w| w.strong_count() > 0);
-            prepared.push(Arc::downgrade(&slot));
-            Ok(slot)
-        });
+        .and_then(|q| register(&handle.prepared, q).map_err(|e| e.to_string()));
     match result {
         Ok(slot) => {
             handle.clear_error();
             Box::into_raw(Box::new(MiniGrafPrepared {
                 slot,
+                registry: handle.prepared.clone(),
                 last_error: LastError::default(),
             }))
         }
@@ -588,6 +683,77 @@ pub extern "C" fn minigraf_prepared_last_error(prepared: *mut MiniGrafPrepared) 
         return std::ptr::null();
     }
     unsafe { &*prepared }.last_error.as_ptr()
+}
+
+/// A new prepared query that may derive at most `n` facts; `prepared` is
+/// unchanged. An allowed `:max-derived-facts` or `:max-results` in the query
+/// still overrides it. `SIZE_MAX` means no limit. Not gated by
+/// `allow_overrides`. Returns NULL on error (call
+/// `minigraf_prepared_last_error` on `prepared`): API-018 after
+/// `minigraf_close` of its database. The new query is freed with
+/// `minigraf_prepared_free`, independently of `prepared`, and closed with its
+/// database as `prepared` is.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_with_max_derived_facts(
+    prepared: *mut MiniGrafPrepared,
+    n: usize,
+) -> *mut MiniGrafPrepared {
+    derive(prepared, |q| q.with_max_derived_facts(n))
+}
+
+/// A new prepared query that may hold at most `bytes` bytes (QRY-012
+/// beyond); `prepared` is unchanged. `0` lets only queries that hold no state
+/// run. Otherwise as `minigraf_prepared_with_max_derived_facts`.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_with_query_memory_limit(
+    prepared: *mut MiniGrafPrepared,
+    bytes: usize,
+) -> *mut MiniGrafPrepared {
+    derive(prepared, |q| q.with_query_memory_limit(bytes))
+}
+
+/// A new prepared query whose rule strata may run at most `n` rounds
+/// (INT-020 beyond); `prepared` is unchanged. An allowed `:max-iterations` in
+/// the query still overrides it. Otherwise as
+/// `minigraf_prepared_with_max_derived_facts`.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_prepared_with_max_iterations(
+    prepared: *mut MiniGrafPrepared,
+    n: usize,
+) -> *mut MiniGrafPrepared {
+    derive(prepared, |q| q.with_max_iterations(n))
+}
+
+/// A copy of `prepared` with `set` applied, listed under the same database.
+fn derive(
+    prepared: *mut MiniGrafPrepared,
+    set: impl FnOnce(minigraf::PreparedQuery) -> minigraf::PreparedQuery,
+) -> *mut MiniGrafPrepared {
+    if prepared.is_null() {
+        return std::ptr::null_mut();
+    }
+    let prepared = unsafe { &*prepared };
+    prepared.last_error.clear();
+    let copy = prepared
+        .slot
+        .lock()
+        .map_err(|_| MinigrafError::invalid_argument("prepared query lock poisoned"))
+        .and_then(|guard| {
+            guard
+                .clone()
+                .ok_or_else(|| MinigrafError::closed("database"))
+        });
+    match copy.and_then(|q| register(&prepared.registry, set(q))) {
+        Ok(slot) => Box::into_raw(Box::new(MiniGrafPrepared {
+            slot,
+            registry: prepared.registry.clone(),
+            last_error: LastError::default(),
+        })),
+        Err(e) => {
+            prepared.last_error.set(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Free a prepared query. Call it also after `minigraf_close` of its database.
@@ -2720,5 +2886,232 @@ mod tests {
         minigraf_udf_result(&mut ctx, std::ptr::null());
         assert!(ctx.result.is_none());
         assert_eq!(ctx.error.as_deref(), Some("user function failed"));
+    }
+
+    // ─── Overrides, open options and prepared setters (minigraf#872) ─────
+
+    const REACH: &str = "(query [:find ?x ?y :where (reach ?x ?y)])";
+    const GROUPED: &str = "(query [:find ?v (count ?e) :where [?e :v ?v]])";
+
+    /// Open `name` in a fresh directory with `options` and load a 4-edge
+    /// chain (10 `reach` pairs) and 3 grouped values. Returns the handle, or
+    /// the open error.
+    fn reach_db(name: &str, options: &str) -> Result<*mut MiniGrafDb, String> {
+        let (_, path) = tmp(name);
+        let o = c(options);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let db = minigraf_open_with_options(path.as_ptr(), o.as_ptr(), &mut err);
+        if db.is_null() {
+            return Err(take(err).unwrap_or_default());
+        }
+        exec(
+            db,
+            "(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d] [:d :edge :e] \
+             [:p :v 1] [:q :v 1] [:r :v 2]])",
+        );
+        exec(db, "(rule [(reach ?x ?y) [?x :edge ?y]])");
+        exec(db, "(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])");
+        Ok(db)
+    }
+
+    /// The rows of `q`, or its error.
+    fn rows_of(db: *mut MiniGrafDb, q: &str) -> Result<usize, String> {
+        let q = c(q);
+        match take(minigraf_execute(db, q.as_ptr())) {
+            Some(json) => Ok(results(&json).len()),
+            None => Err(text(minigraf_last_error(db))),
+        }
+    }
+
+    fn prepared_rows(pq: *mut MiniGrafPrepared) -> Result<usize, String> {
+        match take(minigraf_prepared_execute(pq, std::ptr::null())) {
+            Some(json) => Ok(results(&json).len()),
+            None => Err(prepared_err(pq)),
+        }
+    }
+
+    fn prepare(db: *mut MiniGrafDb, q: &str) -> *mut MiniGrafPrepared {
+        let q = c(q);
+        let pq = minigraf_prepare(db, q.as_ptr());
+        assert!(!pq.is_null(), "prepare failed");
+        pq
+    }
+
+    #[test]
+    fn overridable_defaults_are_the_core_defaults() {
+        let json = take(minigraf_overridable_defaults()).unwrap();
+        assert_eq!(
+            json,
+            r#"["max_derived_facts","max_results","max_iterations"]"#
+        );
+    }
+
+    #[test]
+    fn allow_overrides_replaces_the_defaults() {
+        let derived = "(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 100])";
+        let memory = "(query [:find ?x ?y :where (reach ?x ?y) :query-memory-limit 1000000])";
+        let defaults = take(minigraf_overridable_defaults()).unwrap();
+        for (name, options, derived_ok, memory_ok) in [
+            ("ov_absent", "{}".to_string(), true, false),
+            ("ov_defaults", format!(r#"{{"allow_overrides": {defaults}}}"#), true, false),
+            ("ov_empty", r#"{"allow_overrides": []}"#.into(), false, false),
+            (
+                "ov_memory",
+                r#"{"allow_overrides": ["query_memory_limit", "query_memory_limit"]}"#.into(),
+                false,
+                true,
+            ),
+            (
+                "ov_all",
+                r#"{"allow_overrides": ["max_derived_facts", "max_results", "query_memory_limit", "max_iterations"]}"#.into(),
+                true,
+                true,
+            ),
+        ] {
+            let db = reach_db(name, &options).expect("open");
+            for (q, ok) in [(derived, derived_ok), (memory, memory_ok)] {
+                let qc = c(q);
+                if ok {
+                    assert_eq!(rows_of(db, q), Ok(10), "{name}");
+                    let cursor = minigraf_query(db, qc.as_ptr());
+                    assert!(!cursor.is_null(), "{name} cursor");
+                    minigraf_cursor_free(cursor);
+                    minigraf_prepared_free(prepare(db, q));
+                } else {
+                    assert!(rows_of(db, q).unwrap_err().starts_with("[API-025]"), "{name}");
+                    assert!(minigraf_query(db, qc.as_ptr()).is_null());
+                    assert!(text(minigraf_last_error(db)).starts_with("[API-025]"));
+                    assert!(minigraf_prepare(db, qc.as_ptr()).is_null());
+                    assert!(text(minigraf_last_error(db)).starts_with("[API-025]"));
+                }
+            }
+            minigraf_close(db);
+        }
+    }
+
+    #[test]
+    fn bad_override_names_and_counts_are_refused_like_synchronous() {
+        for options in [
+            r#"{"allow_overrides": ["max_rows"]}"#,
+            r#"{"allow_overrides": "max_results"}"#,
+            r#"{"transaction_chunk_facts": -1}"#,
+            r#"{"max_iterations": -1}"#,
+            r#"{"synchronous": "sometimes"}"#,
+        ] {
+            let e = reach_db("bad_options", options).expect_err("refused");
+            assert!(e.starts_with("[API-017]"), "{options}");
+        }
+    }
+
+    #[test]
+    fn transaction_chunk_facts_commits_a_large_transaction() {
+        let (file, path) = tmp("chunk");
+        let o = c(r#"{"transaction_chunk_facts": 2}"#);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let db = minigraf_open_with_options(path.as_ptr(), o.as_ptr(), &mut err);
+        assert!(!db.is_null());
+        let facts: String = (0..10).map(|i| format!("[:e{i} :n {i}]")).collect();
+        exec(db, &format!("(transact [{facts}])"));
+        minigraf_close(db);
+        let db = minigraf_open(path.as_ptr());
+        assert!(!db.is_null());
+        assert_eq!(rows_of(db, "(query [:find ?n :where [?e :n ?n]])"), Ok(10));
+        minigraf_close(db);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn max_iterations_option_limits_rule_rounds() {
+        let db = reach_db("it_default", "{}").unwrap();
+        assert_eq!(rows_of(db, REACH), Ok(10));
+        minigraf_close(db);
+        let db = reach_db("it_one", r#"{"max_iterations": 1}"#).unwrap();
+        assert!(rows_of(db, REACH).unwrap_err().starts_with("[INT-020]"));
+        minigraf_close(db);
+        let max = format!(r#"{{"max_iterations": {}}}"#, usize::MAX);
+        let db = reach_db("it_max", &max).unwrap();
+        assert_eq!(rows_of(db, REACH), Ok(10));
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn log_writer_takes_the_new_options() {
+        let (file, _) = tmp("writer_options");
+        let out = c(file.with_file_name("out.graph").to_str().unwrap());
+        let o = c(r#"{"allow_overrides": [], "transaction_chunk_facts": 2, "max_iterations": 5}"#);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let w = minigraf_log_writer_create(out.as_ptr(), o.as_ptr(), &mut err);
+        assert!(!w.is_null());
+        assert_eq!(minigraf_log_writer_finish(w), 0);
+        minigraf_log_writer_free(w);
+        assert!(file.with_file_name("out.graph").exists());
+    }
+
+    #[test]
+    fn setters_derive_new_queries() {
+        // The setters are not gated: every override keyword is refused here.
+        let db = reach_db("setters", r#"{"allow_overrides": []}"#).unwrap();
+        type Setter = extern "C" fn(*mut MiniGrafPrepared, usize) -> *mut MiniGrafPrepared;
+        let cases: [(&str, Setter, usize, &str); 3] = [
+            (
+                REACH,
+                minigraf_prepared_with_max_derived_facts,
+                1,
+                "[INT-020]",
+            ),
+            (REACH, minigraf_prepared_with_max_iterations, 1, "[INT-020]"),
+            (
+                GROUPED,
+                minigraf_prepared_with_query_memory_limit,
+                16,
+                "[QRY-012]",
+            ),
+        ];
+        for (q, setter, n, code) in cases {
+            let pq = prepare(db, q);
+            let before = prepared_rows(pq).unwrap();
+            let cursor = minigraf_prepared_query(pq, std::ptr::null());
+            let derived = setter(pq, n);
+            assert!(!derived.is_null());
+            assert!(prepared_rows(derived).unwrap_err().starts_with(code));
+            // Deriving left the receiver's open cursor alone.
+            let mut seen = 0;
+            while let Some(batch) = take(minigraf_cursor_next_batch(cursor, 3)) {
+                seen += serde_json::from_str::<Vec<serde_json::Value>>(&batch)
+                    .unwrap()
+                    .len();
+            }
+            assert_eq!(seen, before);
+            minigraf_cursor_free(cursor);
+            assert_eq!(prepared_rows(pq), Ok(before));
+            let unlimited = setter(derived, usize::MAX);
+            assert_eq!(prepared_rows(unlimited), Ok(before));
+            // Each handle is freed on its own, in any order.
+            minigraf_prepared_free(derived);
+            assert_eq!(prepared_rows(unlimited), Ok(before));
+            minigraf_prepared_free(pq);
+            minigraf_prepared_free(unlimited);
+        }
+
+        // The last value for a limit applies; the others are kept.
+        let pq = prepare(db, REACH);
+        let a = minigraf_prepared_with_max_derived_facts(pq, 1);
+        let b = minigraf_prepared_with_max_iterations(a, 1);
+        let chained = minigraf_prepared_with_max_iterations(b, usize::MAX);
+        assert!(prepared_rows(chained).unwrap_err().starts_with("[INT-020]"));
+        let raised = minigraf_prepared_with_max_derived_facts(chained, usize::MAX);
+        assert_eq!(prepared_rows(raised), Ok(10));
+
+        // After minigraf_close, every handle, derived ones too, is API-018.
+        minigraf_close(db);
+        for h in [pq, a, chained, raised] {
+            assert!(prepared_rows(h).unwrap_err().starts_with("[API-018]"));
+        }
+        assert!(minigraf_prepared_with_max_iterations(pq, 5).is_null());
+        assert!(prepared_err(pq).starts_with("[API-018]"));
+        for h in [pq, a, b, chained, raised] {
+            minigraf_prepared_free(h);
+        }
+        assert!(minigraf_prepared_with_max_iterations(std::ptr::null_mut(), 1).is_null());
     }
 }

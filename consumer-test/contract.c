@@ -147,6 +147,48 @@ int main(int argc, char **argv) {
     check(query_has(again, "[[\"Bob\"]]"), "query after reopen returns [[\"Bob\"]]");
     minigraf_close(again);
 
+    /* minigraf#872: the override list, the new open options and a prepared setter. */
+    char *defaults = minigraf_overridable_defaults();
+    check(defaults != NULL
+              && strcmp(defaults, "[\"max_derived_facts\",\"max_results\",\"max_iterations\"]") == 0,
+          "the default override list comes from core");
+    minigraf_string_free(defaults);
+    char opath[4096];
+    snprintf(opath, sizeof opath, "%s/overrides.graph", argv[1]);
+    char *open_err = NULL;
+    MiniGrafDb *limited = minigraf_open_with_options(
+        opath, "{\"allow_overrides\": [], \"transaction_chunk_facts\": 2, \"max_iterations\": 1000}",
+        &open_err);
+    check(limited != NULL, "open with allow_overrides, transaction_chunk_facts, max_iterations");
+    minigraf_string_free(open_err);
+    check(transact(limited, "(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d]])"), "transact edges");
+    check(query_has_q(limited, "(rule [(reach ?x ?y) [?x :edge ?y]])", "\"ok\""), "rule");
+    check(query_has_q(limited, "(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])", "\"ok\""),
+          "recursive rule");
+    char *refused = minigraf_execute(limited, "(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 10])");
+    const char *refused_err = minigraf_last_error(limited);
+    check(refused == NULL && refused_err != NULL && strncmp(refused_err, "[API-025]", 9) == 0,
+          "an empty override list refuses :max-derived-facts");
+    minigraf_string_free(refused);
+    MiniGrafPrepared *reach = minigraf_prepare(limited, "(query [:find ?x ?y :where (reach ?x ?y)])");
+    MiniGrafPrepared *derived = minigraf_prepared_with_max_iterations(reach, 1);
+    check(derived != NULL, "minigraf_prepared_with_max_iterations");
+    char *over = minigraf_prepared_execute(derived, NULL);
+    const char *over_err = minigraf_prepared_last_error(derived);
+    check(over == NULL && over_err != NULL && strncmp(over_err, "[INT-020]", 9) == 0,
+          "the derived query has its own limit");
+    minigraf_string_free(over);
+    char *still = minigraf_prepared_execute(reach, NULL);
+    check(still != NULL && strstr(still, "\"results\":[[") != NULL, "the receiver is unchanged");
+    minigraf_string_free(still);
+    minigraf_prepared_free(reach);
+    minigraf_close(limited);
+    char *closed = minigraf_prepared_execute(derived, NULL);
+    const char *closed_err = minigraf_prepared_last_error(derived);
+    check(closed == NULL && closed_err != NULL && strncmp(closed_err, "[API-018]", 9) == 0,
+          "a derived query is closed with its database");
+    minigraf_prepared_free(derived);
+
     if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
     return failures ? 1 : 0;
 }

@@ -66,7 +66,8 @@ Compile, from the unpacked archive:
 | `minigraf_checkpoint(db)` | Flush WAL to disk; returns 0 on success |
 | `minigraf_last_error(db)` | Return last error message (valid until next call) |
 | `minigraf_close(db)` | Close the database and free all memory |
-| `minigraf_open_with_options(path, options_json, &err)` | Open with options (`read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`, `max_derived_facts`, `max_results`, `synchronous`: `"full"`/`"normal"`, `query_memory_limit`: bytes one query may hold, else `QRY-012`, default no limit); NULL options = defaults; on error returns NULL and stores the message in `err` |
+| `minigraf_open_with_options(path, options_json, &err)` | Open with options (`read_only`, `page_cache_size`, `allow_unlocked`, `wal_checkpoint_threshold`, `max_derived_facts`, `max_results`, `synchronous`: `"full"`/`"normal"`, `query_memory_limit`: bytes one query may hold, else `QRY-012`, default no limit, `allow_overrides`, `transaction_chunk_facts`, `max_iterations`: see below); NULL options = defaults; on error returns NULL and stores the message in `err` |
+| `minigraf_overridable_defaults()` | The override list used when `allow_overrides` is absent, as a JSON array; free it with `minigraf_string_free` |
 | `minigraf_current_tx_count(db, &out)` | The transaction counter `:as-of N` compares against |
 | `minigraf_query(db, datalog)` | Open a cursor; its answer is fixed when it opens |
 | `minigraf_cursor_vars(c)` | The `:find` variables, as a JSON array |
@@ -85,6 +86,7 @@ Compile, from the unpacked archive:
 | `minigraf_prepared_execute(pq, bindings_json)` | Run it with `bindings_json` (see below; NULL = `{}`) and return JSON like `execute`; NULL on error (`minigraf_prepared_last_error`) |
 | `minigraf_prepared_query(pq, bindings_json)` | Run it and return a cursor |
 | `minigraf_prepared_last_error(pq)` | The error of its last call: `API-017` (bad bindings), `API-022` (missing slot), `API-024` (wrong kind), `API-018` (database closed) |
+| `minigraf_prepared_with_max_derived_facts(pq, n)` / `_with_query_memory_limit(pq, bytes)` / `_with_max_iterations(pq, n)` | A new prepared query with that limit; `pq` is unchanged; NULL on error (`minigraf_prepared_last_error(pq)`) |
 | `minigraf_prepared_free(pq)` | Free a prepared query, also after `minigraf_close` |
 | `minigraf_register_predicate(db, name, f, user_data, destroy)` | Register a predicate (see User functions); 0 on success, -1 on error (`minigraf_last_error`) |
 | `minigraf_register_aggregate(db, name, init, step, finish, acc_free, user_data, destroy)` | Register an aggregate |
@@ -113,6 +115,44 @@ MiniGrafPrepared *pq = minigraf_prepare(db, "(query [:find ?n :where [?e :age $a
 char *thirty = minigraf_prepared_execute(pq, "{\"age\": 30}");
 minigraf_string_free(thirty);
 minigraf_prepared_free(pq);
+```
+
+### Override list and limits
+
+Query text may override some settings with keywords such as `:max-derived-facts 1000`.
+`"allow_overrides"` lists the keywords it may use, by name: `"max_derived_facts"`,
+`"max_results"`, `"query_memory_limit"`, `"max_iterations"`. A missing key keeps the
+defaults, which `minigraf_overridable_defaults()` returns as read from the core library
+(today `["max_derived_facts","max_results","max_iterations"]`). A list replaces the
+defaults, it does not add to them, and `[]` refuses every keyword: a query that uses one
+fails with `API-025` in `minigraf_execute`, `minigraf_query` and `minigraf_prepare`. An
+unknown name, like a bad `"synchronous"` value, fails the open with `API-017`.
+
+`"max_iterations"` is the most rounds each stratum of a rule query may run (default
+1,000,000; more fail with `INT-020`). `"transaction_chunk_facts"` is how many facts one
+transaction on a file database stages before it is written in chunks (default 65,536,
+clamped to 1..=1,000,000). A negative count is `API-017`.
+
+```c
+MiniGrafDb *db = minigraf_open_with_options("app.graph",
+    "{\"allow_overrides\": [\"max_derived_facts\", \"max_results\", \"max_iterations\", \"query_memory_limit\"],"
+    " \"max_iterations\": 10000, \"transaction_chunk_facts\": 16384}", &err);
+```
+
+`minigraf_prepared_with_max_derived_facts(pq, n)`, `minigraf_prepared_with_query_memory_limit(pq, bytes)`
+and `minigraf_prepared_with_max_iterations(pq, n)` each return a new prepared query with that
+limit; `pq` is unchanged. They are application code, so `"allow_overrides"` does not apply
+to them, and an allowed keyword in the query text still overrides them. `SIZE_MAX` means no
+limit. Free the new query with `minigraf_prepared_free`, before or after `pq`; after
+`minigraf_close` of its database it fails with `API-018`, as every prepared query does.
+
+```c
+MiniGrafPrepared *reach = minigraf_prepare(db, "(query [:find ?x ?y :where (reach ?x ?y)])");
+MiniGrafPrepared *small = minigraf_prepared_with_max_derived_facts(reach, 10000);
+char *rows = minigraf_prepared_execute(small, NULL);  /* NULL with INT-020 past the limit */
+minigraf_string_free(rows);
+minigraf_prepared_free(small);
+minigraf_prepared_free(reach);
 ```
 
 ## User functions
