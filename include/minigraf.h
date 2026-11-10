@@ -80,7 +80,8 @@ char *minigraf_overridable_defaults(void);
 // keywords query text may use; absent, `minigraf_overridable_defaults()`;
 // `[]` refuses them all with `API-025`), `transaction_chunk_facts` and
 // `max_iterations` (rounds per stratum of a rule query, else `INT-020`);
-// NULL means all defaults. An unknown key or name is `API-017`. Returns NULL on error and, if
+// NULL means all defaults. An unknown key or name is `API-017`. Returns
+// NULL on error and, if
 // `error_out` is not NULL, stores the message there (free it with
 // `minigraf_string_free`).
 struct MiniGrafDb *minigraf_open_with_options(const char *path,
