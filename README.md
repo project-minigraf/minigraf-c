@@ -238,7 +238,7 @@ char *r = minigraf_execute(db,
 A write transaction stages several `transact`, `retract` and `query` statements, with
 queries seeing what it staged, and then commits them as one transaction or rolls them
 back (minigraf#824). First in the release built on core v3.0.0 (core commit
-`CORE_COMMIT`).
+`639e7382`).
 
 ```c
 MiniGrafTx *tx = minigraf_begin_write(db, "{\"chunk_facts\": 10000}");
