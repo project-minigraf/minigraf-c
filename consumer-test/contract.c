@@ -189,6 +189,37 @@ int main(int argc, char **argv) {
           "a derived query is closed with its database");
     minigraf_prepared_free(derived);
 
+    /* minigraf#824: write transactions through the built library. */
+    char tpath[4096];
+    snprintf(tpath, sizeof tpath, "%s/tx.graph", argv[1]);
+    MiniGrafDb *tdb = minigraf_open(tpath);
+    check(tdb != NULL && transact(tdb, "(transact [[:alice :name \"Alice\"]])"), "open and transact");
+    MiniGrafTx *tx = minigraf_begin_write(tdb, "{\"chunk_facts\": 1000}");
+    check(tx != NULL, "minigraf_begin_write");
+    char *staged = minigraf_tx_execute(tx, "(transact [[:bob :name \"Bob\"]])");
+    check(staged != NULL && strstr(staged, "\"ok\"") != NULL, "a staged write returns ok");
+    minigraf_string_free(staged);
+    char *own = minigraf_tx_execute(tx, "(query [:find ?n :where [?e :name ?n]])");
+    check(own != NULL && strstr(own, "Bob") != NULL, "the transaction reads its own write");
+    minigraf_string_free(own);
+    check(minigraf_tx_commit(tx) == 0, "minigraf_tx_commit");
+    char *after = minigraf_tx_execute(tx, "(query [:find ?n :where [?e :name ?n]])");
+    const char *after_err = minigraf_tx_last_error(tx);
+    check(after == NULL && after_err != NULL && strncmp(after_err, "[API-018]", 9) == 0,
+          "a finished transaction is API-018");
+    minigraf_string_free(after);
+    minigraf_tx_free(tx);
+    MiniGrafTx *rb = minigraf_begin_write(tdb, NULL);
+    char *carol = minigraf_tx_execute(rb, "(transact [[:carol :name \"Carol\"]])");
+    minigraf_string_free(carol);
+    check(minigraf_tx_rollback(rb) == 0, "minigraf_tx_rollback");
+    minigraf_tx_free(rb);
+    check(!query_has(tdb, "Carol"), "the rollback discards");
+    minigraf_close(tdb);
+    tdb = minigraf_open(tpath);
+    check(tdb != NULL && query_has(tdb, "Bob"), "the commit survives reopen");
+    minigraf_close(tdb);
+
     if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
     return failures ? 1 : 0;
 }

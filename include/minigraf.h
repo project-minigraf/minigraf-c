@@ -19,6 +19,9 @@ typedef struct MiniGrafLogWriter MiniGrafLogWriter;
 
 typedef struct MiniGrafPrepared MiniGrafPrepared;
 
+// A write transaction from `minigraf_begin_write`.
+typedef struct MiniGrafTx MiniGrafTx;
+
 // The result and error of one user-function call, set with
 // `minigraf_udf_result` and `minigraf_udf_error`. A `ctx` is valid only
 // during the call it was passed to.
@@ -282,6 +285,51 @@ int minigraf_register_aggregate(struct MiniGrafDb *db,
                                 minigraf_destroy_fn acc_free,
                                 void *user_data,
                                 minigraf_destroy_fn destroy);
+
+// Begin a write transaction on `handle`. `options_json` is a JSON object
+// with any of `synchronous` (`"full"` or `"normal"`: this commit's WAL sync)
+// and `chunk_facts` (facts staged before a file database writes the
+// transaction in chunks); NULL or an absent key is the database's value. An
+// unknown key or a negative count is `API-017`.
+//
+// The transaction holds the database's write lock until it is committed,
+// rolled back or freed: a write or a begin from another thread waits until
+// then, and a query from another thread reads the committed state. On this
+// thread, the handle's calls that read or write (`minigraf_execute`,
+// `minigraf_query`, `minigraf_fact_log`, `minigraf_prepare`,
+// `minigraf_checkpoint`, `minigraf_begin_write`, a prepared query's runs)
+// fail with `INT-001` until it finishes. `API-014` on a read-only database.
+//
+// Returns NULL on error (call `minigraf_last_error` on `handle`). Free the
+// transaction with `minigraf_tx_free`, also after `minigraf_close`.
+struct MiniGrafTx *minigraf_begin_write(struct MiniGrafDb *handle, const char *options_json);
+
+// Run one Datalog command inside the transaction: a `transact`/`retract` is
+// staged and returns `{"ok":true}`, a `query` reads the committed facts plus
+// the staged ones, a `rule` is registered at once (a rollback keeps it).
+// Returns JSON encoded like `minigraf_execute`'s (free it with
+// `minigraf_string_free`), or NULL on error (call `minigraf_tx_last_error`).
+// A statement that fails stages nothing and leaves the transaction open.
+// `API-018` once the transaction is finished.
+char *minigraf_tx_execute(struct MiniGrafTx *tx, const char *datalog);
+
+// Commit every staged change as one transaction. Returns 0 on success, -1 on
+// error (call `minigraf_tx_last_error`). A commit that fails rolls the
+// transaction back; either way it is finished. `API-018` once finished.
+int minigraf_tx_commit(struct MiniGrafTx *tx);
+
+// Discard every staged change and finish the transaction. Does nothing on a
+// finished one. Returns 0 (-1 only for NULL).
+int minigraf_tx_rollback(struct MiniGrafTx *tx);
+
+// The error of the last call on `tx`, or NULL if it had none. Valid until
+// the next call on it.
+const char *minigraf_tx_last_error(struct MiniGrafTx *tx);
+
+// Free a transaction, rolling it back if it is open. Call it also after
+// `minigraf_close` of its database, which rolls back an open transaction.
+// NULL is a no-op.
+void minigraf_tx_free(struct MiniGrafTx *tx);
 
 // Return the last error message. Valid until the next call on the same handle.
 // Returns NULL if no error has occurred.
