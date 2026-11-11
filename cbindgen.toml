@@ -37,4 +37,5 @@ include = [
     "MiniGrafCursor",
     "MiniGrafFactLog",
     "MiniGrafLogWriter",
+    "MiniGrafTx",
 ]

@@ -92,6 +92,9 @@ pub struct MiniGrafDb {
     /// so that none keeps the file open. Shared with the prepared queries,
     /// which list the queries their setters derive in it.
     prepared: Arc<Registry>,
+    /// Every write transaction begun on this handle, rolled back when it is
+    /// closed (minigraf#824).
+    transactions: Arc<TxRegistry>,
 }
 
 /// The prepared queries of one handle, by weak reference; `None` once the
@@ -105,6 +108,19 @@ fn new_registry() -> Arc<Registry> {
 
 impl Drop for MiniGrafDb {
     fn drop(&mut self) {
+        // An open transaction holds the write lock and the file: roll it
+        // back first. Its handle stays valid and reports API-018.
+        let open = match self.transactions.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        for slot in open.into_iter().flatten().filter_map(|w| w.upgrade()) {
+            if let Ok(mut tx) = slot.lock()
+                && let Some(tx) = tx.take()
+            {
+                tx.rollback();
+            }
+        }
         // A prepared query holds the file open too (core's PreparedQuery keeps
         // the storage), so release every one before the database itself.
         let listed = match self.prepared.lock() {
@@ -193,6 +209,7 @@ pub extern "C" fn minigraf_open(path: *const c_char) -> *mut MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
             prepared: new_registry(),
+            transactions: new_tx_registry(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -206,6 +223,7 @@ pub extern "C" fn minigraf_open_in_memory() -> *mut MiniGrafDb {
             db: Mutex::new(db),
             last_error: Mutex::new(None),
             prepared: new_registry(),
+            transactions: new_tx_registry(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -442,6 +460,7 @@ pub extern "C" fn minigraf_open_with_options(
             db: Mutex::new(db),
             last_error: Mutex::new(None),
             prepared: new_registry(),
+            transactions: new_tx_registry(),
         })),
         Err(e) => {
             report(error_out, e.to_string());
@@ -1668,6 +1687,232 @@ pub extern "C" fn minigraf_register_aggregate(
         .map_err(|e| e.to_string())
     })();
     handle.status(result)
+}
+
+// ─── Write transactions (minigraf#824) ────────────────────────────────────────
+
+/// An open transaction, `None` once finished.
+/// cbindgen:ignore
+type TxSlot = Mutex<Option<minigraf::OwnedWriteTransaction>>;
+
+/// The transactions of one handle, by weak reference; `None` once the handle
+/// is closed, so that no transaction is listed after it.
+/// cbindgen:ignore
+type TxRegistry = Mutex<Option<Vec<Weak<TxSlot>>>>;
+
+fn new_tx_registry() -> Arc<TxRegistry> {
+    Arc::new(Mutex::new(Some(Vec::new())))
+}
+
+/// `options_json` of `minigraf_begin_write`: every key optional, an absent
+/// key is the database's value.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TxOptionsJson {
+    synchronous: Option<SyncModeJson>,
+    chunk_facts: Option<usize>,
+}
+
+impl TxOptionsJson {
+    fn to_core(&self) -> minigraf::TxOptions {
+        let mut o = minigraf::TxOptions::new();
+        if let Some(v) = self.synchronous {
+            o = o.synchronous(match v {
+                SyncModeJson::Full => minigraf::SyncMode::Full,
+                SyncModeJson::Normal => minigraf::SyncMode::Normal,
+            });
+        }
+        if let Some(v) = self.chunk_facts {
+            o = o.chunk_facts(v);
+        }
+        o
+    }
+}
+
+/// A write transaction from `minigraf_begin_write`.
+pub struct MiniGrafTx {
+    slot: Arc<TxSlot>,
+    last_error: LastError,
+}
+
+/// API-018: a call on a finished transaction.
+fn tx_finished() -> String {
+    MinigrafError::closed("write transaction").to_string()
+}
+
+impl MiniGrafTx {
+    /// Run `f` on the open transaction; on an error, set `last_error`.
+    fn with<T>(
+        &self,
+        f: impl FnOnce(&mut minigraf::OwnedWriteTransaction) -> Result<T, MinigrafError>,
+    ) -> Option<T> {
+        let result = match self.slot.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(tx) => f(tx).map_err(|e| e.to_string()),
+                None => Err(tx_finished()),
+            },
+            Err(_) => Err("transaction lock poisoned".to_string()),
+        };
+        self.outcome(result)
+    }
+
+    fn outcome<T>(&self, result: Result<T, String>) -> Option<T> {
+        match result {
+            Ok(v) => {
+                self.last_error.clear();
+                Some(v)
+            }
+            Err(e) => {
+                self.last_error.set(e);
+                None
+            }
+        }
+    }
+}
+
+/// Begin a write transaction on `handle`. `options_json` is a JSON object
+/// with any of `synchronous` (`"full"` or `"normal"`: this commit's WAL sync)
+/// and `chunk_facts` (facts staged before a file database writes the
+/// transaction in chunks); NULL or an absent key is the database's value. An
+/// unknown key or a negative count is `API-017`.
+///
+/// The transaction holds the database's write lock until it is committed,
+/// rolled back or freed: a write or a begin from another thread waits until
+/// then, and a query from another thread reads the committed state. On this
+/// thread, the handle's calls that read or write (`minigraf_execute`,
+/// `minigraf_query`, `minigraf_fact_log`, `minigraf_prepare`,
+/// `minigraf_checkpoint`, `minigraf_begin_write`, a prepared query's runs)
+/// fail with `INT-001` until it finishes. `API-014` on a read-only database.
+///
+/// Returns NULL on error (call `minigraf_last_error` on `handle`). Free the
+/// transaction with `minigraf_tx_free`, also after `minigraf_close`.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_begin_write(
+    handle: *mut MiniGrafDb,
+    options_json: *const c_char,
+) -> *mut MiniGrafTx {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*handle };
+    let result = json_arg::<TxOptionsJson>(options_json, "options_json")
+        .map_err(|e| e.to_string())
+        .and_then(|options| {
+            // No lock of this handle is held while the begin waits.
+            handle.core().and_then(|db| {
+                db.begin_write_owned_with(options.to_core())
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .and_then(|tx| {
+            let mut guard = handle
+                .transactions
+                .lock()
+                .map_err(|_| "database lock poisoned".to_string())?;
+            let Some(listed) = guard.as_mut() else {
+                tx.rollback();
+                return Err(MinigrafError::closed("database").to_string());
+            };
+            let slot = Arc::new(Mutex::new(Some(tx)));
+            listed.retain(|w| w.strong_count() > 0);
+            listed.push(Arc::downgrade(&slot));
+            Ok(slot)
+        });
+    match result {
+        Ok(slot) => {
+            handle.clear_error();
+            Box::into_raw(Box::new(MiniGrafTx {
+                slot,
+                last_error: LastError::default(),
+            }))
+        }
+        Err(e) => {
+            handle.set_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Run one Datalog command inside the transaction: a `transact`/`retract` is
+/// staged and returns `{"ok":true}`, a `query` reads the committed facts plus
+/// the staged ones, a `rule` is registered at once (a rollback keeps it).
+/// Returns JSON encoded like `minigraf_execute`'s (free it with
+/// `minigraf_string_free`), or NULL on error (call `minigraf_tx_last_error`).
+/// A statement that fails stages nothing and leaves the transaction open.
+/// `API-018` once the transaction is finished.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_tx_execute(tx: *mut MiniGrafTx, datalog: *const c_char) -> *mut c_char {
+    if tx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tx = unsafe { &*tx };
+    let datalog = match arg_str(datalog, "datalog") {
+        Ok(d) => d,
+        Err(e) => {
+            tx.last_error.set(e.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    tx.with(|t| t.execute(datalog))
+        .map_or(std::ptr::null_mut(), |r| {
+            c_string(query_result_to_json(r)).into_raw()
+        })
+}
+
+/// Commit every staged change as one transaction. Returns 0 on success, -1 on
+/// error (call `minigraf_tx_last_error`). A commit that fails rolls the
+/// transaction back; either way it is finished. `API-018` once finished.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_tx_commit(tx: *mut MiniGrafTx) -> c_int {
+    if tx.is_null() {
+        return -1;
+    }
+    let tx = unsafe { &*tx };
+    let result = match tx.slot.lock() {
+        Ok(mut guard) => match guard.take() {
+            Some(t) => t.commit().map_err(|e| e.to_string()),
+            None => Err(tx_finished()),
+        },
+        Err(_) => Err("transaction lock poisoned".to_string()),
+    };
+    tx.outcome(result).map_or(-1, |()| 0)
+}
+
+/// Discard every staged change and finish the transaction. Does nothing on a
+/// finished one. Returns 0 (-1 only for NULL).
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_tx_rollback(tx: *mut MiniGrafTx) -> c_int {
+    if tx.is_null() {
+        return -1;
+    }
+    let tx = unsafe { &*tx };
+    if let Ok(mut guard) = tx.slot.lock()
+        && let Some(t) = guard.take()
+    {
+        t.rollback();
+    }
+    tx.last_error.clear();
+    0
+}
+
+/// The error of the last call on `tx`, or NULL if it had none. Valid until
+/// the next call on it.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_tx_last_error(tx: *mut MiniGrafTx) -> *const c_char {
+    if tx.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &*tx }.last_error.as_ptr()
+}
+
+/// Free a transaction, rolling it back if it is open. Call it also after
+/// `minigraf_close` of its database, which rolls back an open transaction.
+/// NULL is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn minigraf_tx_free(tx: *mut MiniGrafTx) {
+    if !tx.is_null() {
+        unsafe { drop(Box::from_raw(tx)) };
+    }
 }
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -3113,5 +3358,424 @@ mod tests {
             minigraf_prepared_free(h);
         }
         assert!(minigraf_prepared_with_max_iterations(std::ptr::null_mut(), 1).is_null());
+    }
+
+    // ── Write transactions (minigraf#824) ────────────────────────────────────
+
+    const NAMES: &str = "(query [:find ?n :where [?e :person/name ?n]])";
+    const TX_SETUP: &str =
+        r#"(transact [[:alice :person/name "Alice"] [:bob :person/name "Bob"]])"#;
+
+    /// A raw pointer that may cross threads, as a C caller's would.
+    struct Ptr<T>(*mut T);
+    impl<T> Clone for Ptr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T> Copy for Ptr<T> {}
+    unsafe impl<T> Send for Ptr<T> {}
+    unsafe impl<T> Sync for Ptr<T> {}
+
+    impl<T> Ptr<T> {
+        /// The pointer. A method, so that a closure captures the whole
+        /// `Ptr` (which is `Send`) rather than its field.
+        fn get(self) -> *mut T {
+            self.0
+        }
+    }
+
+    fn names_of(json: &str) -> Vec<String> {
+        let mut names: Vec<String> = results(json)
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn db_names(db: *mut MiniGrafDb) -> Vec<String> {
+        let q = c(NAMES);
+        names_of(&take(minigraf_execute(db, q.as_ptr())).expect("query"))
+    }
+
+    fn code_of(msg: &str) -> String {
+        let start = msg.find('[').map_or(0, |i| i + 1);
+        msg[start..].chars().take(7).collect()
+    }
+
+    fn db_code(db: *mut MiniGrafDb) -> String {
+        code_of(&text(minigraf_last_error(db)))
+    }
+
+    fn tx_code(tx: *mut MiniGrafTx) -> String {
+        code_of(&text(minigraf_tx_last_error(tx)))
+    }
+
+    fn tx_exec(tx: *mut MiniGrafTx, q: &str) -> Option<String> {
+        let q = c(q);
+        take(minigraf_tx_execute(tx, q.as_ptr()))
+    }
+
+    fn begin(db: *mut MiniGrafDb, options: Option<&str>) -> *mut MiniGrafTx {
+        let o = options.map(c);
+        minigraf_begin_write(db, o.as_ref().map_or(std::ptr::null(), |o| o.as_ptr()))
+    }
+
+    fn tx_db() -> *mut MiniGrafDb {
+        let db = minigraf_open_in_memory();
+        exec(db, TX_SETUP);
+        db
+    }
+
+    fn within<T: Send + 'static>(
+        t: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> (Option<T>, std::sync::mpsc::Receiver<T>) {
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(f());
+        });
+        match recv.recv_timeout(t) {
+            Ok(v) => (Some(v), recv),
+            Err(_) => (None, recv),
+        }
+    }
+
+    const WAITS: std::time::Duration = std::time::Duration::from_millis(300);
+    const STUCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[test]
+    fn tx_reads_its_own_writes_commits_and_survives_reopen() {
+        let (file, path) = tmp("tx_commit");
+        let db = minigraf_open(path.as_ptr());
+        exec(db, TX_SETUP);
+        let tx = begin(db, None);
+        assert!(!tx.is_null());
+        assert_eq!(
+            tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).as_deref(),
+            Some(r#"{"ok":true}"#)
+        );
+        tx_exec(tx, r#"(retract [[:bob :person/name "Bob"]])"#).expect("retract");
+        assert_eq!(
+            names_of(&tx_exec(tx, NAMES).expect("query")),
+            ["Alice", "Carol"]
+        );
+        let p = Ptr(db);
+        let (outside, _) = within(STUCK, move || db_names(p.get()));
+        assert_eq!(outside.expect("a query does not wait"), ["Alice", "Bob"]);
+        assert_eq!(minigraf_tx_commit(tx), 0);
+        minigraf_tx_free(tx);
+        assert_eq!(db_names(db), ["Alice", "Carol"]);
+        minigraf_close(db);
+        let db = minigraf_open(path.as_ptr());
+        assert_eq!(db_names(db), ["Alice", "Carol"], "after reopening");
+        minigraf_close(db);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn tx_rollback_and_free_discard() {
+        let (file, path) = tmp("tx_rollback");
+        let db = minigraf_open(path.as_ptr());
+        exec(db, TX_SETUP);
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+        assert_eq!(minigraf_tx_rollback(tx), 0);
+        minigraf_tx_free(tx);
+        // Freed open: rolled back, and the write lock is free.
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:dave :person/name "Dave"]])"#).expect("transact");
+        minigraf_tx_free(tx);
+        assert_eq!(db_names(db), ["Alice", "Bob"]);
+        exec(db, r#"(transact [[:erin :person/name "Erin"]])"#);
+        minigraf_close(db);
+        let db = minigraf_open(path.as_ptr());
+        assert_eq!(db_names(db), ["Alice", "Bob", "Erin"], "after reopening");
+        minigraf_close(db);
+        minigraf_tx_free(std::ptr::null_mut());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn tx_free_on_another_thread_releases_the_lock() {
+        let db = tx_db();
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+        let t = Ptr(tx);
+        std::thread::spawn(move || minigraf_tx_free(t.get()))
+            .join()
+            .unwrap();
+        let p = Ptr(db);
+        let (other, _) = within(STUCK, move || {
+            exec(p.get(), r#"(transact [[:x :person/name "X"]])"#);
+        });
+        assert!(other.is_some(), "another thread writes");
+        exec(db, r#"(transact [[:y :person/name "Y"]])"#);
+        assert_eq!(db_names(db), ["Alice", "Bob", "X", "Y"]);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn tx_failed_statement_and_finished_transaction() {
+        let db = tx_db();
+        let tx = begin(db, None);
+        assert!(tx_exec(tx, "(transact [[:a").is_none());
+        assert_eq!(tx_code(tx), "PRS-004");
+        assert!(
+            tx_exec(
+                tx,
+                r#"(transact [[:x :p/v 1 {:valid-from "2020-01-01T00:00:00Z"}] [:x :p/v 1 {:valid-from "2021-01-01T00:00:00Z"}]])"#
+            )
+            .is_none()
+        );
+        assert_eq!(tx_code(tx), "API-011");
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("still open");
+        assert!(minigraf_tx_last_error(tx).is_null(), "cleared by a success");
+        assert_eq!(minigraf_tx_commit(tx), 0);
+        assert!(tx_exec(tx, NAMES).is_none());
+        assert_eq!(tx_code(tx), "API-018");
+        assert_eq!(minigraf_tx_commit(tx), -1);
+        assert_eq!(tx_code(tx), "API-018");
+        assert_eq!(minigraf_tx_rollback(tx), 0, "does nothing");
+        assert!(minigraf_tx_last_error(tx).is_null());
+        minigraf_tx_free(tx);
+        assert_eq!(db_names(db), ["Alice", "Bob", "Carol"]);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn tx_guards_the_begin_thread_and_others_wait() {
+        let db = tx_db();
+        let pq = minigraf_prepare(db, c(NAMES).as_ptr());
+        assert!(!pq.is_null());
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+
+        let q = c(NAMES);
+        assert!(minigraf_execute(db, q.as_ptr()).is_null());
+        assert_eq!(db_code(db), "INT-001", "execute");
+        assert!(minigraf_query(db, q.as_ptr()).is_null());
+        assert_eq!(db_code(db), "INT-001", "query");
+        assert!(minigraf_prepare(db, q.as_ptr()).is_null());
+        assert_eq!(db_code(db), "INT-001", "prepare");
+        assert!(minigraf_fact_log(db, std::ptr::null()).is_null());
+        assert_eq!(db_code(db), "INT-001", "fact_log");
+        assert_eq!(minigraf_checkpoint(db), -1);
+        assert_eq!(db_code(db), "INT-001", "checkpoint");
+        assert!(begin(db, None).is_null());
+        assert_eq!(db_code(db), "INT-001", "begin");
+        assert!(minigraf_prepared_execute(pq, std::ptr::null()).is_null());
+        assert_eq!(code_of(&prepared_err(pq)), "INT-001", "prepared execute");
+
+        let p = Ptr(db);
+        let (early_write, write) = within(WAITS, move || {
+            exec(p.get(), r#"(transact [[:w :person/name "W"]])"#);
+        });
+        assert!(early_write.is_none(), "a write from another thread waits");
+        let (early_begin, begun) = within(WAITS, move || {
+            let tx = begin(p.get(), None);
+            assert!(!tx.is_null());
+            tx_exec(tx, r#"(transact [[:b :person/name "B"]])"#).expect("transact");
+            assert_eq!(minigraf_tx_commit(tx), 0);
+            minigraf_tx_free(tx);
+        });
+        assert!(early_begin.is_none(), "a begin from another thread waits");
+        let (query, _) = within(STUCK, move || db_names(p.get()));
+        assert_eq!(
+            query.expect("a query runs while a begin waits"),
+            ["Alice", "Bob"]
+        );
+
+        assert_eq!(minigraf_tx_commit(tx), 0);
+        minigraf_tx_free(tx);
+        write.recv_timeout(STUCK).expect("the write ends");
+        begun.recv_timeout(STUCK).expect("the begin ends");
+        assert_eq!(db_names(db), ["Alice", "B", "Bob", "Carol", "W"]);
+        minigraf_prepared_free(pq);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn tx_used_from_several_threads() {
+        let db = tx_db();
+        let tx = Ptr(begin(db, None));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        tx_exec(tx.get(), &format!("(transact [[:t{i}_{j} :p/n {j}]])"))
+                            .expect("a whole statement");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Committed on another thread than the one that began it.
+        let committed = std::thread::spawn(move || minigraf_tx_commit(tx.get()))
+            .join()
+            .unwrap();
+        assert_eq!(committed, 0);
+        let count = take(minigraf_execute(
+            db,
+            c("(query [:find (count ?e) :where [?e :p/n _]])").as_ptr(),
+        ))
+        .unwrap();
+        assert!(count.contains("[[160]]"), "every statement committed");
+        minigraf_tx_free(tx.get());
+        exec(db, r#"(transact [[:z :person/name "Z"]])"#);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn tx_options_and_read_only() {
+        let (file, path) = tmp("tx_options");
+        let db = minigraf_open(path.as_ptr());
+        exec(db, TX_SETUP);
+        assert!(begin(db, Some(r#"{"chunk_facts": -1}"#)).is_null());
+        assert_eq!(db_code(db), "API-017", "negative chunk_facts");
+        assert!(begin(db, Some(r#"{"chunk": 3}"#)).is_null());
+        assert_eq!(db_code(db), "API-017", "unknown key");
+        assert!(begin(db, Some(r#"{"synchronous": "sometimes"}"#)).is_null());
+        assert_eq!(db_code(db), "API-017", "bad synchronous");
+        let tx = begin(db, Some(r#"{"synchronous": "normal", "chunk_facts": 3}"#));
+        assert!(!tx.is_null());
+        for i in 0..4 {
+            tx_exec(
+                tx,
+                &format!(
+                    "(transact [[:c{i}a :person/name \"C{i}a\"] [:c{i}b :person/name \"C{i}b\"]])"
+                ),
+            )
+            .expect("transact");
+        }
+        assert_eq!(names_of(&tx_exec(tx, NAMES).unwrap()).len(), 10);
+        assert_eq!(minigraf_tx_commit(tx), 0);
+        minigraf_tx_free(tx);
+        minigraf_close(db);
+        let db = minigraf_open(path.as_ptr());
+        assert_eq!(db_names(db).len(), 10, "every fact after reopening");
+        minigraf_close(db);
+        let ro = minigraf_open_with_options(
+            path.as_ptr(),
+            c(r#"{"read_only": true}"#).as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert!(begin(ro, None).is_null());
+        assert_eq!(db_code(ro), "API-014");
+        minigraf_close(ro);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn close_rolls_back_an_open_transaction() {
+        let (file, path) = tmp("tx_close");
+        let db = minigraf_open(path.as_ptr());
+        exec(db, TX_SETUP);
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+        minigraf_close(db);
+        assert!(tx_exec(tx, NAMES).is_none());
+        assert_eq!(tx_code(tx), "API-018", "execute after close");
+        assert_eq!(minigraf_tx_commit(tx), -1);
+        assert_eq!(tx_code(tx), "API-018", "commit after close");
+        assert_eq!(minigraf_tx_rollback(tx), 0);
+        // The file lock was released: the path reopens.
+        let db = minigraf_open(path.as_ptr());
+        assert!(!db.is_null());
+        assert_eq!(db_names(db), ["Alice", "Bob"]);
+        minigraf_close(db);
+        minigraf_tx_free(tx); // after the close, still safe
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    unsafe extern "C" fn carol_only(
+        _: *mut MiniGrafUdfContext,
+        _: *mut c_void,
+        value_json: *const c_char,
+    ) -> c_int {
+        let v = unsafe { CStr::from_ptr(value_json) }.to_str().unwrap();
+        c_int::from(v.contains("Carol"))
+    }
+
+    unsafe extern "C" fn calls_back(
+        ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        _: *const c_char,
+    ) -> c_int {
+        let db = user_data.cast::<MiniGrafDb>();
+        let q = CString::new(NAMES).unwrap();
+        let r = minigraf_execute(db, q.as_ptr());
+        if r.is_null() {
+            let msg = unsafe { CStr::from_ptr(minigraf_last_error(db)) }.to_owned();
+            minigraf_udf_error(ctx, msg.as_ptr());
+            return -1;
+        }
+        minigraf_string_free(r);
+        1
+    }
+
+    #[test]
+    fn tx_user_functions() {
+        let db = tx_db();
+        assert_eq!(
+            minigraf_register_predicate(
+                db,
+                c("carol?").as_ptr(),
+                Some(carol_only),
+                std::ptr::null_mut(),
+                None
+            ),
+            0
+        );
+        assert_eq!(
+            minigraf_register_predicate(
+                db,
+                c("calls-back?").as_ptr(),
+                Some(calls_back),
+                db.cast(),
+                None
+            ),
+            0
+        );
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+        let seen = tx_exec(
+            tx,
+            "(query [:find ?n :where [?e :person/name ?n] [(carol? ?n)]])",
+        )
+        .expect("a user function sees staged values");
+        assert_eq!(names_of(&seen), ["Carol"]);
+        assert!(
+            tx_exec(
+                tx,
+                "(query [:find ?n :where [?e :person/name ?n] [(calls-back? ?n)]])"
+            )
+            .is_none()
+        );
+        assert_eq!(tx_code(tx), "QRY-014");
+        assert!(text(minigraf_tx_last_error(tx)).contains("INT-001"));
+        assert_eq!(minigraf_tx_commit(tx), 0);
+        minigraf_tx_free(tx);
+        assert_eq!(db_names(db), ["Alice", "Bob", "Carol"]);
+        minigraf_close(db);
+    }
+
+    #[test]
+    fn tx_rules_stay_after_rollback() {
+        let db = tx_db();
+        let tx = begin(db, None);
+        tx_exec(tx, "(rule [(named ?e ?n) [?e :person/name ?n]])").expect("rule");
+        minigraf_tx_rollback(tx);
+        minigraf_tx_free(tx);
+        let r = take(minigraf_execute(
+            db,
+            c("(query [:find ?n :where (named ?e ?n)])").as_ptr(),
+        ))
+        .expect("the rule is still registered");
+        assert_eq!(names_of(&r), ["Alice", "Bob"]);
+        minigraf_close(db);
     }
 }

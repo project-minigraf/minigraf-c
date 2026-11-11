@@ -233,6 +233,50 @@ char *r = minigraf_execute(db,
   another function: no lock of the handle is held while the core runs. A callback must not
   close the database it runs on.
 
+## Write transactions
+
+A write transaction stages several `transact`, `retract` and `query` statements, with
+queries seeing what it staged, and then commits them as one transaction or rolls them
+back (minigraf#824). First in the release built on core v3.0.0 (core commit
+`32d71ce0`).
+
+```c
+MiniGrafTx *tx = minigraf_begin_write(db, "{\"chunk_facts\": 10000}");
+if (!tx) { fprintf(stderr, "%s\n", minigraf_last_error(db)); return 1; }
+char *r = minigraf_tx_execute(tx, "(transact [[:alice :balance 70] [:bob :balance 80]])");
+if (r) {
+    minigraf_string_free(r);
+    if (minigraf_tx_commit(tx) != 0) fprintf(stderr, "%s\n", minigraf_tx_last_error(tx));
+}
+minigraf_tx_free(tx); /* rolls back if it is still open */
+```
+
+- `minigraf_begin_write(db, options_json)`: `options_json` is NULL or a JSON object with
+  `"synchronous"` (`"full"` / `"normal"`, this commit's WAL sync) and `"chunk_facts"`
+  (facts staged before a file database writes the transaction in chunks); an absent key
+  is the database's value, an unknown key or a negative count API-017. NULL on error
+  (`minigraf_last_error(db)`): API-014 on a read-only database.
+- `minigraf_tx_execute(tx, datalog)` returns what `minigraf_execute` returns (free it
+  with `minigraf_string_free`); a staged write returns `{"ok":true}`. A statement that
+  fails returns NULL (`minigraf_tx_last_error(tx)`), stages nothing and leaves the
+  transaction open. There are no cursors or prepared queries inside a transaction.
+- `minigraf_tx_commit(tx)` (0 or -1) applies everything as one transaction; a commit
+  that fails rolls back. `minigraf_tx_rollback(tx)` discards it. Either way it is
+  finished: `minigraf_tx_execute` and `minigraf_tx_commit` then fail with API-018, and
+  `minigraf_tx_rollback` does nothing and returns 0.
+- `minigraf_tx_free(tx)` rolls back an open transaction and frees it; NULL is a no-op.
+  Commit is always explicit.
+- `minigraf_close(db)` rolls back an open transaction and finishes it (API-018
+  afterwards). Its `MiniGrafTx*` must still be freed, which is safe after the close.
+- A transaction handle may be used from several threads; each call runs whole.
+- An open transaction holds the database's write lock until it finishes, so end every
+  transaction explicitly or through `minigraf_tx_free`. On the thread that began it, database
+  calls (`minigraf_execute`, `minigraf_query`, `minigraf_prepare`, `minigraf_fact_log`, `minigraf_checkpoint`, another `minigraf_begin_write`, prepared queries) fail with INT-001, and so do user functions its statements run. On
+  other threads, writes and begins wait until it ends; queries read the committed
+  state. Use a transaction on the thread that began it: a thread that uses one it did
+  not begin and then writes through the database waits on that transaction.
+- Rules registered inside a transaction stay registered after a rollback.
+
 ## Building from source
 
 ```bash
