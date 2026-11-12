@@ -1733,6 +1733,26 @@ impl TxOptionsJson {
 pub struct MiniGrafTx {
     slot: Arc<TxSlot>,
     last_error: LastError,
+    /// The thread running a statement of this transaction, which holds
+    /// `slot` meanwhile. A call from that thread comes from a user function
+    /// of the statement and would wait for `slot` forever (minigraf#886).
+    running: Mutex<Option<std::thread::ThreadId>>,
+}
+
+/// Clears `MiniGrafTx::running` when the statement ends, also by a panic.
+struct Running<'a>(&'a Mutex<Option<std::thread::ThreadId>>);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// INT-001: a user function called the transaction whose statement runs it.
+fn tx_reentered() -> String {
+    "[INT-001] a write transaction is already in progress on this thread; \
+     a user function cannot call the transaction it runs in"
+        .to_string()
 }
 
 /// API-018: a call on a finished transaction.
@@ -1746,14 +1766,32 @@ impl MiniGrafTx {
         &self,
         f: impl FnOnce(&mut minigraf::OwnedWriteTransaction) -> Result<T, MinigrafError>,
     ) -> Option<T> {
+        if self.in_own_statement() {
+            return self.outcome(Err(tx_reentered()));
+        }
         let result = match self.slot.lock() {
             Ok(mut guard) => match guard.as_mut() {
-                Some(tx) => f(tx).map_err(|e| e.to_string()),
+                Some(tx) => {
+                    // Declared after `guard`, so cleared before `slot` is
+                    // released.
+                    *self.running.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(std::thread::current().id());
+                    let _running = Running(&self.running);
+                    f(tx).map_err(|e| e.to_string())
+                }
                 None => Err(tx_finished()),
             },
             Err(_) => Err("transaction lock poisoned".to_string()),
         };
         self.outcome(result)
+    }
+
+    /// Whether this thread is running a statement of this transaction. Only
+    /// the thread that set `running` can read its own id there, so the answer
+    /// cannot change under the caller. Checked before `slot` is locked:
+    /// another thread's call passes and waits for the statement.
+    fn in_own_statement(&self) -> bool {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id())
     }
 
     fn outcome<T>(&self, result: Result<T, String>) -> Option<T> {
@@ -1824,6 +1862,7 @@ pub extern "C" fn minigraf_begin_write(
             Box::into_raw(Box::new(MiniGrafTx {
                 slot,
                 last_error: LastError::default(),
+                running: Mutex::new(None),
             }))
         }
         Err(e) => {
@@ -1840,6 +1879,11 @@ pub extern "C" fn minigraf_begin_write(
 /// `minigraf_string_free`), or NULL on error (call `minigraf_tx_last_error`).
 /// A statement that fails stages nothing and leaves the transaction open.
 /// `API-018` once the transaction is finished.
+///
+/// A user function cannot call the transaction whose statement runs it:
+/// there `minigraf_tx_execute`, `minigraf_tx_commit` and
+/// `minigraf_tx_rollback` fail with `INT-001` and change nothing, and
+/// `minigraf_tx_free` must not be called.
 #[unsafe(no_mangle)]
 pub extern "C" fn minigraf_tx_execute(tx: *mut MiniGrafTx, datalog: *const c_char) -> *mut c_char {
     if tx.is_null() {
@@ -1868,6 +1912,9 @@ pub extern "C" fn minigraf_tx_commit(tx: *mut MiniGrafTx) -> c_int {
         return -1;
     }
     let tx = unsafe { &*tx };
+    if tx.in_own_statement() {
+        return tx.outcome::<()>(Err(tx_reentered())).map_or(-1, |()| 0);
+    }
     let result = match tx.slot.lock() {
         Ok(mut guard) => match guard.take() {
             Some(t) => t.commit().map_err(|e| e.to_string()),
@@ -1879,13 +1926,18 @@ pub extern "C" fn minigraf_tx_commit(tx: *mut MiniGrafTx) -> c_int {
 }
 
 /// Discard every staged change and finish the transaction. Does nothing on a
-/// finished one. Returns 0 (-1 only for NULL).
+/// finished one. Returns 0; -1 for NULL, and with `INT-001` (call
+/// `minigraf_tx_last_error`) from a user function of one of its statements.
 #[unsafe(no_mangle)]
 pub extern "C" fn minigraf_tx_rollback(tx: *mut MiniGrafTx) -> c_int {
     if tx.is_null() {
         return -1;
     }
     let tx = unsafe { &*tx };
+    if tx.in_own_statement() {
+        tx.last_error.set(tx_reentered());
+        return -1;
+    }
     if let Ok(mut guard) = tx.slot.lock()
         && let Some(t) = guard.take()
     {
@@ -3761,6 +3813,94 @@ mod tests {
         minigraf_tx_free(tx);
         assert_eq!(db_names(db), ["Alice", "Bob", "Carol"]);
         minigraf_close(db);
+    }
+
+    /// Calls the transaction whose statement runs it (minigraf#886): 1 if
+    /// every call was refused with INT-001, else 0.
+    unsafe extern "C" fn calls_its_tx(
+        _: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        _: *const c_char,
+    ) -> c_int {
+        let tx = user_data.cast::<MiniGrafTx>();
+        let q = CString::new(NAMES).unwrap();
+        let executed = minigraf_tx_execute(tx, q.as_ptr());
+        let mut refused = executed.is_null() && tx_code(tx) == "INT-001";
+        minigraf_string_free(executed);
+        refused &= minigraf_tx_commit(tx) == -1 && tx_code(tx) == "INT-001";
+        refused &= minigraf_tx_rollback(tx) == -1 && tx_code(tx) == "INT-001";
+        c_int::from(refused)
+    }
+
+    /// As `calls_its_tx`, passing the refusal on as its own failure.
+    unsafe extern "C" fn commits_its_tx(
+        ctx: *mut MiniGrafUdfContext,
+        user_data: *mut c_void,
+        _: *const c_char,
+    ) -> c_int {
+        let tx = user_data.cast::<MiniGrafTx>();
+        if minigraf_tx_commit(tx) == 0 {
+            return 1;
+        }
+        let msg = unsafe { CStr::from_ptr(minigraf_tx_last_error(tx)) }.to_owned();
+        minigraf_udf_error(ctx, msg.as_ptr());
+        -1
+    }
+
+    #[test]
+    fn tx_refuses_a_call_from_its_own_statement() {
+        let db = tx_db();
+        let tx = begin(db, None);
+        tx_exec(tx, r#"(transact [[:carol :person/name "Carol"]])"#).expect("transact");
+        for (name, f) in [
+            (
+                "calls-tx?",
+                calls_its_tx as unsafe extern "C" fn(_, _, _) -> _,
+            ),
+            ("commits-tx?", commits_its_tx),
+        ] {
+            assert_eq!(
+                minigraf_register_predicate(db, c(name).as_ptr(), Some(f), tx.cast(), None),
+                0
+            );
+        }
+        let (tx, db) = (Ptr(tx), Ptr(db));
+
+        let (rows, _recv) = within(STUCK, move || {
+            tx_exec(
+                tx.get(),
+                "(query [:find ?n :where [?e :person/name ?n] [(calls-tx? ?n)]])",
+            )
+        });
+        let rows = rows
+            .expect("the statement returns: no deadlock")
+            .expect("every call was refused, so every row passes");
+        assert_eq!(names_of(&rows), ["Alice", "Bob", "Carol"]);
+        assert!(
+            minigraf_tx_last_error(tx.get()).is_null(),
+            "the statement succeeded"
+        );
+
+        let (failed, _recv) = within(STUCK, move || {
+            tx_exec(
+                tx.get(),
+                "(query [:find ?n :where [?e :person/name ?n] [(commits-tx? ?n)]])",
+            )
+        });
+        assert!(
+            failed
+                .expect("the statement returns: no deadlock")
+                .is_none(),
+            "the function passed the refusal on"
+        );
+        assert_eq!(tx_code(tx.get()), "QRY-014");
+        assert!(text(minigraf_tx_last_error(tx.get())).contains("INT-001"));
+
+        // Neither the refused commits nor the refused rollback finished it.
+        assert_eq!(minigraf_tx_commit(tx.get()), 0);
+        minigraf_tx_free(tx.get());
+        assert_eq!(db_names(db.get()), ["Alice", "Bob", "Carol"]);
+        minigraf_close(db.get());
     }
 
     #[test]
