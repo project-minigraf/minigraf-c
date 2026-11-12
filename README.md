@@ -271,7 +271,7 @@ minigraf_tx_free(tx); /* rolls back if it is still open */
 - A transaction handle may be used from several threads; each call runs whole.
 - An open transaction holds the database's write lock until it finishes, so end every
   transaction explicitly or through `minigraf_tx_free`. On the thread that began it, database
-  calls (`minigraf_execute`, `minigraf_query`, `minigraf_prepare`, `minigraf_fact_log`, `minigraf_checkpoint`, another `minigraf_begin_write`, prepared queries) fail with INT-001, and so do user functions its statements run. On
+  calls (`minigraf_execute`, `minigraf_query`, `minigraf_prepare`, `minigraf_fact_log`, `minigraf_checkpoint`, another `minigraf_begin_write`, prepared queries) fail with INT-001, and so do user functions its statements run. A user function that calls the transaction it runs in (`minigraf_tx_execute`, `minigraf_tx_commit`, `minigraf_tx_rollback`) gets INT-001 too. On
   other threads, writes and begins wait until it ends; queries read the committed
   state. Use a transaction on the thread that began it: a thread that uses one it did
   not begin and then writes through the database waits on that transaction.

@@ -311,6 +311,11 @@ struct MiniGrafTx *minigraf_begin_write(struct MiniGrafDb *handle, const char *o
 // `minigraf_string_free`), or NULL on error (call `minigraf_tx_last_error`).
 // A statement that fails stages nothing and leaves the transaction open.
 // `API-018` once the transaction is finished.
+//
+// A user function cannot call the transaction whose statement runs it:
+// there `minigraf_tx_execute`, `minigraf_tx_commit` and
+// `minigraf_tx_rollback` fail with `INT-001` and change nothing, and
+// `minigraf_tx_free` must not be called.
 char *minigraf_tx_execute(struct MiniGrafTx *tx, const char *datalog);
 
 // Commit every staged change as one transaction. Returns 0 on success, -1 on
@@ -319,7 +324,8 @@ char *minigraf_tx_execute(struct MiniGrafTx *tx, const char *datalog);
 int minigraf_tx_commit(struct MiniGrafTx *tx);
 
 // Discard every staged change and finish the transaction. Does nothing on a
-// finished one. Returns 0 (-1 only for NULL).
+// finished one. Returns 0; -1 for NULL, and with `INT-001` (call
+// `minigraf_tx_last_error`) from a user function of one of its statements.
 int minigraf_tx_rollback(struct MiniGrafTx *tx);
 
 // The error of the last call on `tx`, or NULL if it had none. Valid until
